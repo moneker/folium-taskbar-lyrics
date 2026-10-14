@@ -151,7 +151,11 @@
     bridge.toggleDrawer();
   }
 
-  toggleBtn.addEventListener('pointerdown', handleToggleTrigger);
+  // Assert topmost on any pointer interaction with the taskbar lyrics window
+  appRoot.addEventListener('pointerdown', () => {
+    bridge.assertTop();
+  });
+
   toggleBtn.addEventListener('click', handleToggleTrigger);
 
   // Playback Control Buttons
