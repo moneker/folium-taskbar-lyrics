@@ -1,0 +1,537 @@
+/* mods/taskbar-lyrics/view/taskbar.css: Styling & animations for the Taskbar Lyrics Drawer */
+
+:root {
+  --bg-acrylic: rgba(18, 18, 24, 0.94);
+  --bg-card: rgba(255, 255, 255, 0.08);
+  --accent-color: #6366f1;
+  --accent-glow: rgba(99, 102, 241, 0.45);
+  --accent-gradient: linear-gradient(135deg, #818cf8 0%, #6366f1 50%, #4f46e5 100%);
+  --text-primary: #f8fafc;
+  --text-secondary: rgba(248, 250, 252, 0.65);
+  --text-tertiary: rgba(248, 250, 252, 0.4);
+  --border-subtle: rgba(255, 255, 255, 0.12);
+  --border-highlight: rgba(255, 255, 255, 0.22);
+  --button-hover-bg: rgba(255, 255, 255, 0.14);
+  --taskbar-height: 48px;
+  --drawer-easing-in: cubic-bezier(0.16, 1, 0.3, 1);
+  --drawer-easing-out: cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+  user-select: none;
+  -webkit-user-drag: none;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+}
+
+html, body {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background-color: transparent;
+}
+
+/* Root Application Container */
+.app-root {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  background: transparent;
+}
+
+/* ======================================================== */
+/* 1. Permanent Left Replacement Button                     */
+/* ======================================================== */
+.toggle-button {
+  position: absolute;
+  left: 6px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 44px;
+  height: 36px;
+  border-radius: 18px;
+  background: var(--bg-acrylic);
+  border: 1px solid var(--border-subtle);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.15);
+  backdrop-filter: blur(24px) saturate(180%);
+  -webkit-backdrop-filter: blur(24px) saturate(180%);
+  color: var(--text-primary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  z-index: 100;
+  transition: all 0.24s cubic-bezier(0.16, 1, 0.3, 1);
+  outline: none;
+}
+
+.toggle-button:hover {
+  background: rgba(35, 35, 48, 0.98);
+  border-color: var(--border-highlight);
+  box-shadow: 0 0 18px var(--accent-glow), inset 0 1px 0 rgba(255, 255, 255, 0.25);
+  transform: translateY(-50%) scale(1.05);
+}
+
+.toggle-button:active {
+  transform: translateY(-50%) scale(0.95);
+}
+
+.toggle-icon-container {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+}
+
+/* Equalizer Bars on Toggle Button */
+.equalizer-bars {
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 14px;
+}
+
+.equalizer-bars .bar {
+  width: 2.5px;
+  background: var(--accent-gradient);
+  border-radius: 2px;
+  transition: height 0.2s ease;
+}
+
+.bar-1 { height: 6px; }
+.bar-2 { height: 12px; }
+.bar-3 { height: 8px; }
+
+.app-root.playing .bar-1 {
+  animation: eqJump1 0.7s infinite alternate ease-in-out;
+}
+.app-root.playing .bar-2 {
+  animation: eqJump2 0.5s infinite alternate ease-in-out;
+}
+.app-root.playing .bar-3 {
+  animation: eqJump3 0.8s infinite alternate ease-in-out;
+}
+
+@keyframes eqJump1 {
+  0% { height: 4px; }
+  100% { height: 13px; }
+}
+@keyframes eqJump2 {
+  0% { height: 6px; }
+  100% { height: 14px; }
+}
+@keyframes eqJump3 {
+  0% { height: 3px; }
+  100% { height: 11px; }
+}
+
+.chevron-icon {
+  transition: transform 0.3s var(--drawer-easing-in);
+}
+
+.app-root.expanded .chevron-icon {
+  transform: rotate(180deg);
+}
+
+/* ======================================================== */
+/* 2. Drawer Panel (Slide-in from Right to Left, Out to Left) */
+/* ======================================================== */
+.drawer-panel {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 100%;
+  height: 100%;
+  padding-left: 58px; /* Leave room for the left toggle button */
+  padding-right: 18px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  transform: translateX(100%);
+  opacity: 0;
+  pointer-events: none;
+  transition: transform 0.36s var(--drawer-easing-in), opacity 0.26s ease;
+  z-index: 50;
+}
+
+/* Expanded state: entered from right, fully active */
+.app-root.expanded .drawer-panel {
+  transform: translateX(0);
+  opacity: 1;
+  pointer-events: auto;
+  transition: transform 0.36s var(--drawer-easing-in), opacity 0.26s ease;
+}
+
+/* Exiting state: continues sliding to the LEFT out of the screen */
+.app-root.exiting .drawer-panel {
+  transform: translateX(-100%);
+  opacity: 0;
+  pointer-events: none;
+  transition: transform 0.32s var(--drawer-easing-out), opacity 0.22s ease;
+}
+
+/* Folia Lyrics Stage Fluid Cover Background */
+.drawer-bg-container {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+  z-index: -2;
+  background: var(--bg-acrylic);
+}
+
+.drawer-cover-bg-wrap {
+  position: absolute;
+  inset: -24px;
+  overflow: hidden;
+}
+
+.drawer-cover-bg {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  object-position: center;
+  filter: blur(40px) saturate(220%) brightness(0.65);
+  transform: scale(1.35);
+  opacity: 0;
+  transition: opacity 0.9s cubic-bezier(0.16, 1, 0.3, 1);
+  will-change: opacity;
+}
+
+.drawer-cover-bg.loaded {
+  opacity: 0.9;
+}
+
+.drawer-cover-overlay {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    90deg,
+    rgba(12, 12, 18, 0.88) 0%,
+    rgba(12, 12, 18, 0.6) 35%,
+    rgba(12, 12, 18, 0.6) 65%,
+    rgba(12, 12, 18, 0.88) 100%
+  );
+  z-index: 1;
+}
+
+.drawer-bg-acrylic {
+  position: absolute;
+  inset: 0;
+  backdrop-filter: blur(28px) saturate(180%);
+  -webkit-backdrop-filter: blur(28px) saturate(180%);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.14);
+  z-index: 2;
+}
+
+.drawer-highlight-edge {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent 0%, rgba(255, 255, 255, 0.24) 15%, rgba(255, 255, 255, 0.24) 85%, transparent 100%);
+  z-index: -1;
+}
+
+/* ======================================================== */
+/* 3. Left Section: Song Metadata & Artwork                 */
+/* ======================================================== */
+.song-meta-section {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+  max-width: 250px;
+}
+
+.cover-container {
+  position: relative;
+  width: 36px;
+  height: 36px;
+  border-radius: 8px;
+  overflow: hidden;
+  background: rgba(30, 30, 40, 0.8);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.45);
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.cover-image {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  opacity: 0;
+  transition: opacity 0.3s ease;
+  z-index: 2;
+}
+
+.cover-fallback {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-tertiary);
+  z-index: 1;
+}
+
+.cover-glow {
+  position: absolute;
+  inset: 0;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  pointer-events: none;
+  z-index: 3;
+}
+
+.meta-texts {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  line-height: 1.25;
+}
+
+.song-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  letter-spacing: -0.2px;
+}
+
+.song-artist {
+  font-size: 11px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ======================================================== */
+/* 4. Center Section: Synchronized Karaoke Lyrics           */
+/* ======================================================== */
+.lyrics-stage-section {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: max-content;
+  max-width: calc(100% - 460px);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 0 16px;
+  overflow: hidden;
+  text-align: center;
+  pointer-events: none;
+  transition: all 0.2s ease;
+}
+
+.lyrics-row {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+
+.primary-row {
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.lyrics-stage-section.single-row .primary-row {
+  height: 36px;
+}
+
+.lyric-main {
+  font-size: 15.5px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+  /* Fluid progressive karaoke gradient wipe with soft luminous edge */
+  background: linear-gradient(
+    to right,
+    #ffffff 0%,
+    #ffffff calc(var(--wipe-pct, 0%) - 1%),
+    rgba(199, 210, 254, 0.95) var(--wipe-pct, 0%),
+    rgba(255, 255, 255, 0.35) calc(var(--wipe-pct, 0%) + 1.2%),
+    rgba(255, 255, 255, 0.35) 100%
+  );
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  filter: drop-shadow(0 0 10px rgba(99, 102, 241, 0.28));
+  opacity: 1;
+  transform: translateY(0);
+  transition: opacity 0.14s ease, transform 0.14s ease, filter 0.2s ease;
+  will-change: background, opacity, transform;
+}
+
+.lyrics-stage-section.single-row .lyric-main {
+  font-size: 17.5px;
+  letter-spacing: 0.6px;
+}
+
+.lyric-main.line-switching {
+  opacity: 0.3;
+  transform: translateY(2px);
+}
+
+.secondary-row {
+  height: 15px;
+  margin-top: 1px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.lyrics-stage-section.single-row .secondary-row {
+  display: none !important;
+}
+
+.lyric-sub {
+  font-size: 11.5px;
+  font-weight: 400;
+  color: rgba(248, 250, 252, 0.55);
+  letter-spacing: 0.3px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+
+/* ======================================================== */
+/* 5. Right Section: Controls & Progress Bar                */
+/* ======================================================== */
+.controls-section {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+  margin-left: auto;
+}
+
+/* Progress Slider */
+.progress-container {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.time-label {
+  font-size: 10.5px;
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+  min-width: 26px;
+  text-align: center;
+}
+
+.progress-track {
+  position: relative;
+  width: 68px;
+  height: 4px;
+  background: rgba(255, 255, 255, 0.16);
+  border-radius: 2px;
+  cursor: pointer;
+  transition: height 0.15s ease, background-color 0.15s ease;
+}
+
+.progress-track:hover {
+  height: 6px;
+  background: rgba(255, 255, 255, 0.24);
+}
+
+.progress-fill {
+  position: absolute;
+  left: 0;
+  top: 0;
+  height: 100%;
+  width: 0%;
+  background: var(--accent-gradient);
+  border-radius: 3px;
+  box-shadow: 0 0 8px var(--accent-glow);
+  pointer-events: none;
+}
+
+.progress-thumb {
+  position: absolute;
+  top: 50%;
+  left: 0%;
+  transform: translate(-50%, -50%) scale(0);
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #ffffff;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.5);
+  pointer-events: none;
+  transition: transform 0.15s ease;
+}
+
+.progress-track:hover .progress-thumb {
+  transform: translate(-50%, -50%) scale(1);
+}
+
+/* Button Group */
+.buttons-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.action-btn {
+  background: transparent;
+  border: none;
+  color: var(--text-secondary);
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+  outline: none;
+}
+
+.action-btn:hover {
+  background: var(--button-hover-bg);
+  color: var(--text-primary);
+  transform: scale(1.1);
+}
+
+.action-btn:active {
+  transform: scale(0.92);
+}
+
+.play-pause-btn {
+  width: 36px;
+  height: 36px;
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.12);
+  color: var(--text-primary);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+}
+
+.play-pause-btn:hover {
+  background: var(--accent-gradient);
+  box-shadow: 0 0 14px var(--accent-glow);
+  transform: scale(1.08);
+}
+
+.hidden {
+  display: none !important;
+}
