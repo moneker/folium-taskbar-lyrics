@@ -1,15 +1,16 @@
 // mods/taskbar-lyrics/index.cjs
 // Main process entry for Taskbar Lyrics Drawer mod.
 // Calculates Windows taskbar geometry, manages the drawer overlay window,
-// ensures topmost persistence against system tray overflows, and registers tray controls.
+// and bridges playback actions securely.
+// Note: Supported exclusively on Windows (win32).
 
 'use strict';
 
 const path = require('path');
-const { BrowserWindow, screen, ipcMain, Menu } = require('electron');
+const { BrowserWindow, screen, ipcMain } = require('electron');
 
-// mod main controller for Windows taskbar lyrics drawer
 const COLLAPSED_WIDTH = 56; // Width of the permanent left replacement button
+const MAX_PENDING_ACTIONS = 50;
 
 /**
  * Calculates the bounding rectangle of the Windows taskbar using screen display metrics.
@@ -78,6 +79,12 @@ function resolveTaskbarBounds() {
  * @param {import('../../src/mods/folium/contract').FoliumNodeApi} api
  */
 module.exports = function activate(api) {
+  // Enforce Windows platform limitation
+  if (process.platform !== 'win32') {
+    api.log.info('Taskbar Lyrics mod is only supported on Windows (win32). Inactive on this platform.');
+    return () => {};
+  }
+
   api.log.info(`Activating Taskbar Lyrics Drawer mod (v${api.manifest.version})`);
 
   let taskbarWindow = null;
@@ -89,76 +96,15 @@ module.exports = function activate(api) {
   let collapseTimer = null;
   let blurDebounceTimer = null;
 
-  // Intercept Menu.buildFromTemplate to dynamically insert "任务栏歌词" in packaged Folia apps
-  const originalBuildFromTemplate = Menu.buildFromTemplate;
-  Menu.buildFromTemplate = function (template) {
-    try {
-      if (Array.isArray(template)) {
-        const isTrayMenu = template.some(
-          (item) => item && (
-            item.label === '桌面歌词' ||
-            item.label === 'Desktop Lyrics' ||
-            item.label === 'Lirik Desktop' ||
-            item.label === '壁纸模式' ||
-            item.label === 'Wallpaper Mode' ||
-            item.label === 'Mode Wallpaper'
-          )
-        );
-        const alreadyHasTaskbar = template.some(
-          (item) => item && (item.id === 'mod-taskbar-lyrics' || item.label === '任务栏歌词' || item.label === 'Taskbar Lyrics')
-        );
-
-        if (isTrayMenu && !alreadyHasTaskbar) {
-          let targetIdx = template.findIndex(
-            (item) => item && (
-              item.label === '桌面歌词' ||
-              item.label === 'Desktop Lyrics' ||
-              item.label === 'Lirik Desktop'
-            )
-          );
-          if (targetIdx === -1) {
-            targetIdx = template.findIndex(
-              (item) => item && (
-                item.label === '壁纸模式' ||
-                item.label === 'Wallpaper Mode' ||
-                item.label === 'Mode Wallpaper'
-              )
-            );
-          }
-
-          const insertAt = targetIdx !== -1 ? targetIdx + 1 : Math.max(0, template.length - 2);
-          template.splice(insertAt, 0, {
-            id: 'mod-taskbar-lyrics',
-            label: '任务栏歌词',
-            type: 'checkbox',
-            checked: Boolean(isEnabled),
-            click: () => {
-              if (isEnabled) {
-                disableTaskbarLyrics();
-              } else {
-                enableTaskbarLyrics();
-              }
-              if (typeof global.__refreshTrayMenu === 'function') {
-                global.__refreshTrayMenu();
-              }
-            },
-          });
-        }
-      }
-    } catch (e) {
-      api.log.error('Failed to inject taskbar lyrics to tray template', e);
-    }
-    return originalBuildFromTemplate.call(this, template);
-  };
-
   /**
-   * Reasserts the window to the topmost screen-saver tier.
-   * Prevents Windows Explorer / NotifyIconOverflowWindow from pushing the button behind Shell_TrayWnd.
+   * Asserts the window to floating level without aggressive screen-saver takeover.
    */
   function assertTopmost() {
     if (!taskbarWindow || taskbarWindow.isDestroyed() || !isEnabled) return;
     try {
-      taskbarWindow.setAlwaysOnTop(true, 'screen-saver', 1);
+      if (!taskbarWindow.isAlwaysOnTop()) {
+        taskbarWindow.setAlwaysOnTop(true, 'screen-saver');
+      }
       if (typeof taskbarWindow.moveTop === 'function') {
         taskbarWindow.moveTop();
       }
@@ -209,14 +155,13 @@ module.exports = function activate(api) {
         preload: path.join(__dirname, 'view', 'preload.cjs'),
         nodeIntegration: false,
         contextIsolation: true,
-        webSecurity: false,
         backgroundThrottling: false,
       },
     });
 
-    win.setAlwaysOnTop(true, 'screen-saver', 2);
+    win.setAlwaysOnTop(true, 'screen-saver');
     if (typeof win.setVisibleOnAllWorkspaces === 'function') {
-      win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+      win.setVisibleOnAllWorkspaces(true);
     }
 
     win.loadFile(path.join(__dirname, 'view', 'menu.html'));
@@ -226,7 +171,7 @@ module.exports = function activate(api) {
         win.show();
         win.focus();
         if (latestSnapshot) {
-          win.webContents.send('taskbar-drawer:snapshot', latestSnapshot);
+          win.webContents.send('taskbar-lyrics:snapshot', latestSnapshot);
         }
       }
     });
@@ -243,43 +188,103 @@ module.exports = function activate(api) {
     return win;
   }
 
-  function closeMenuWindow() {
-    if (menuWindow && !menuWindow.isDestroyed() && menuWindow.isVisible()) {
-      menuWindow.hide();
+  function showMenuWindow() {
+    if (menuWindow && !menuWindow.isDestroyed()) {
+      const bounds = resolveMenuBounds();
+      menuWindow.setBounds(bounds);
+      menuWindow.show();
+      menuWindow.focus();
+      if (latestSnapshot) {
+        menuWindow.webContents.send('taskbar-lyrics:snapshot', latestSnapshot);
+      }
+      return menuWindow;
     }
+    return createMenuWindow();
   }
 
   function toggleMenuWindow() {
     if (menuWindow && !menuWindow.isDestroyed() && menuWindow.isVisible()) {
       closeMenuWindow();
     } else {
-      if (!menuWindow || menuWindow.isDestroyed()) {
-        createMenuWindow();
-      } else {
-        const bounds = resolveMenuBounds();
-        menuWindow.setBounds(bounds);
-        menuWindow.show();
-        menuWindow.focus();
-        if (latestSnapshot) {
-          menuWindow.webContents.send('taskbar-drawer:snapshot', latestSnapshot);
-        }
-      }
+      showMenuWindow();
     }
   }
 
-  // Window creation
+  function closeMenuWindow() {
+    if (menuWindow && !menuWindow.isDestroyed()) {
+      menuWindow.hide();
+    }
+  }
+
+  /**
+   * Expands the drawer: resizes the window to full taskbar width and animates.
+   */
+  function expandDrawer() {
+    if (!taskbarWindow || taskbarWindow.isDestroyed() || !isEnabled) return;
+    if (isDrawerExpanded) return;
+
+    if (collapseTimer) {
+      clearTimeout(collapseTimer);
+      collapseTimer = null;
+    }
+
+    isDrawerExpanded = true;
+    const bounds = resolveTaskbarBounds();
+    taskbarWindow.setBounds({
+      x: bounds.x,
+      y: bounds.y,
+      width: bounds.width,
+      height: bounds.height,
+    });
+
+    assertTopmost();
+    taskbarWindow.webContents.send('taskbar-lyrics:state', 'expanded');
+  }
+
+  /**
+   * Collapses the drawer: notifies view to slide out, then resizes back to 56px.
+   */
+  function collapseDrawer() {
+    if (!taskbarWindow || taskbarWindow.isDestroyed() || !isEnabled) return;
+    if (!isDrawerExpanded) return;
+
+    closeMenuWindow();
+    isDrawerExpanded = false;
+    taskbarWindow.webContents.send('taskbar-lyrics:state', 'collapsed');
+
+    if (collapseTimer) clearTimeout(collapseTimer);
+    collapseTimer = setTimeout(() => {
+      if (taskbarWindow && !taskbarWindow.isDestroyed() && !isDrawerExpanded) {
+        const bounds = resolveTaskbarBounds();
+        taskbarWindow.setBounds({
+          x: bounds.x,
+          y: bounds.y,
+          width: COLLAPSED_WIDTH,
+          height: bounds.height,
+        });
+        assertTopmost();
+      }
+    }, 420);
+  }
+
+  function toggleDrawer() {
+    if (isDrawerExpanded) {
+      collapseDrawer();
+    } else {
+      expandDrawer();
+    }
+  }
+
   function createWindow() {
     if (taskbarWindow && !taskbarWindow.isDestroyed()) {
       return taskbarWindow;
     }
 
     const bounds = resolveTaskbarBounds();
-    const initialWidth = isDrawerExpanded ? bounds.width : COLLAPSED_WIDTH;
-
     const win = new BrowserWindow({
       x: bounds.x,
       y: bounds.y,
-      width: initialWidth,
+      width: isDrawerExpanded ? bounds.width : COLLAPSED_WIDTH,
       height: bounds.height,
       frame: false,
       transparent: true,
@@ -297,14 +302,13 @@ module.exports = function activate(api) {
         preload: path.join(__dirname, 'view', 'preload.cjs'),
         nodeIntegration: false,
         contextIsolation: true,
-        webSecurity: false, // Allows cross-origin album artwork without mixed-content/CORS blocking
         backgroundThrottling: false,
       },
     });
 
-    win.setAlwaysOnTop(true, 'screen-saver', 1);
+    win.setAlwaysOnTop(true, 'screen-saver');
     if (typeof win.setVisibleOnAllWorkspaces === 'function') {
-      win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+      win.setVisibleOnAllWorkspaces(true);
     }
 
     win.loadFile(path.join(__dirname, 'view', 'taskbar.html'));
@@ -315,14 +319,13 @@ module.exports = function activate(api) {
         if (isEnabled) {
           win.showInactive();
         }
-        win.webContents.send('taskbar-drawer:state', isDrawerExpanded ? 'expanded' : 'collapsed');
+        win.webContents.send('taskbar-lyrics:state', isDrawerExpanded ? 'expanded' : 'collapsed');
         if (latestSnapshot) {
-          win.webContents.send('taskbar-drawer:snapshot', latestSnapshot);
+          win.webContents.send('taskbar-lyrics:snapshot', latestSnapshot);
         }
       }
     });
 
-    // Prevent Windows "Show Desktop" (Win+D) or taskbar clicks from burying the button
     win.on('minimize', () => {
       if (taskbarWindow && !taskbarWindow.isDestroyed() && isEnabled) {
         taskbarWindow.restore();
@@ -331,86 +334,40 @@ module.exports = function activate(api) {
     });
 
     win.on('blur', () => {
-      if (blurDebounceTimer) clearTimeout(blurDebounceTimer);
-      blurDebounceTimer = setTimeout(() => {
-        assertTopmost();
-      }, 100);
+      if (taskbarWindow && !taskbarWindow.isDestroyed() && isEnabled) {
+        taskbarWindow.moveTop();
+      }
+    });
+
+    win.webContents.on('render-process-gone', (_event, details) => {
+      api.log.warn(`Taskbar lyrics renderer process gone (${details.reason}), recreating window...`);
+      if (taskbarWindow && !taskbarWindow.isDestroyed()) {
+        try { taskbarWindow.destroy(); } catch {}
+      }
+      taskbarWindow = null;
+      if (isEnabled) {
+        createWindow();
+      }
+    });
+
+    win.on('unresponsive', () => {
+      api.log.warn('Taskbar lyrics window unresponsive, reloading webContents...');
+      if (taskbarWindow && !taskbarWindow.isDestroyed()) {
+        try { taskbarWindow.webContents.reload(); } catch {}
+      }
     });
 
     win.on('closed', () => {
       taskbarWindow = null;
+      if (menuWindow && !menuWindow.isDestroyed()) {
+        menuWindow.close();
+      }
     });
 
     taskbarWindow = win;
     return win;
   }
 
-  // Expand drawer: first widen the window to full taskbar width, then trigger slide-in CSS
-  function expandDrawer() {
-    if (!isEnabled) {
-      enableTaskbarLyrics();
-    }
-    if (!taskbarWindow || taskbarWindow.isDestroyed()) {
-      createWindow();
-    }
-    if (collapseTimer) {
-      clearTimeout(collapseTimer);
-      collapseTimer = null;
-    }
-
-    isDrawerExpanded = true;
-    const bounds = resolveTaskbarBounds();
-    taskbarWindow.setBounds({
-      x: bounds.x,
-      y: bounds.y,
-      width: bounds.width,
-      height: bounds.height,
-    });
-    assertTopmost();
-    taskbarWindow.webContents.send('taskbar-drawer:state', 'expanded');
-    if (typeof global.__refreshTrayMenu === 'function') {
-      global.__refreshTrayMenu();
-    }
-    return true;
-  }
-
-  // Collapse drawer: first trigger slide-out CSS, then shrink window back to 56px
-  function collapseDrawer() {
-    if (!taskbarWindow || taskbarWindow.isDestroyed()) return false;
-    isDrawerExpanded = false;
-
-    taskbarWindow.webContents.send('taskbar-drawer:state', 'collapsed');
-
-    // Safety fallback timer to resize window back to COLLAPSED_WIDTH
-    if (collapseTimer) clearTimeout(collapseTimer);
-    collapseTimer = setTimeout(() => {
-      if (taskbarWindow && !taskbarWindow.isDestroyed() && !isDrawerExpanded) {
-        const bounds = resolveTaskbarBounds();
-        taskbarWindow.setBounds({
-          x: bounds.x,
-          y: bounds.y,
-          width: COLLAPSED_WIDTH,
-          height: bounds.height,
-        });
-        assertTopmost();
-      }
-    }, 380);
-
-    if (typeof global.__refreshTrayMenu === 'function') {
-      global.__refreshTrayMenu();
-    }
-    return false;
-  }
-
-  function toggleDrawer() {
-    if (isDrawerExpanded) {
-      return collapseDrawer();
-    } else {
-      return expandDrawer();
-    }
-  }
-
-  // Enable/show taskbar lyrics
   function enableTaskbarLyrics() {
     isEnabled = true;
     if (!taskbarWindow || taskbarWindow.isDestroyed()) {
@@ -419,44 +376,38 @@ module.exports = function activate(api) {
       assertTopmost();
       taskbarWindow.showInactive();
     }
-    if (typeof global.__refreshTrayMenu === 'function') {
-      global.__refreshTrayMenu();
-    }
   }
 
-  // Disable/hide taskbar lyrics
   function disableTaskbarLyrics() {
     isEnabled = false;
-    if (isDrawerExpanded) {
-      isDrawerExpanded = false;
-    }
+    closeMenuWindow();
     if (taskbarWindow && !taskbarWindow.isDestroyed()) {
       taskbarWindow.hide();
     }
-    if (typeof global.__refreshTrayMenu === 'function') {
-      global.__refreshTrayMenu();
-    }
   }
 
-  // Handle IPC from the drawer view
+  const isAuthorizedSender = (event) => {
+    if (!event || !event.sender) return false;
+    const senderId = event.sender.id;
+    const taskbarId = taskbarWindow && !taskbarWindow.isDestroyed() ? taskbarWindow.webContents.id : null;
+    const menuId = menuWindow && !menuWindow.isDestroyed() ? menuWindow.webContents.id : null;
+    return Boolean(senderId && (senderId === taskbarId || senderId === menuId));
+  };
+
+  // IPC Event Handlers with Sender Verification
   const onToggleDrawer = (event) => {
-    if (taskbarWindow && event.sender === taskbarWindow.webContents) {
-      toggleDrawer();
-    }
+    if (isAuthorizedSender(event)) toggleDrawer();
   };
   const onExpandDrawer = (event) => {
-    if (taskbarWindow && event.sender === taskbarWindow.webContents) {
-      expandDrawer();
-    }
+    if (isAuthorizedSender(event)) expandDrawer();
   };
   const onCollapseDrawer = (event) => {
-    if (taskbarWindow && event.sender === taskbarWindow.webContents) {
-      collapseDrawer();
-    }
+    if (isAuthorizedSender(event)) collapseDrawer();
   };
-  const onAnimationDone = (event, state) => {
-    if (taskbarWindow && event.sender === taskbarWindow.webContents) {
-      if (state === 'collapsed' && !isDrawerExpanded) {
+  const onAnimationDone = (event, finalState) => {
+    if (!isAuthorizedSender(event)) return;
+    if (finalState === 'collapsed' && !isDrawerExpanded) {
+      if (taskbarWindow && !taskbarWindow.isDestroyed()) {
         const bounds = resolveTaskbarBounds();
         taskbarWindow.setBounds({
           x: bounds.x,
@@ -468,27 +419,34 @@ module.exports = function activate(api) {
       }
     }
   };
+
   const onPlaybackAction = (event, payload) => {
-    if ((taskbarWindow && event.sender === taskbarWindow.webContents) ||
-        (menuWindow && event.sender === menuWindow.webContents)) {
-      pendingActions.push(payload);
+    if (isAuthorizedSender(event)) {
+      if (pendingActions.length < MAX_PENDING_ACTIONS) {
+        pendingActions.push(payload);
+      }
     }
   };
 
-  const onToggleMenu = () => {
-    toggleMenuWindow();
+  const onToggleMenu = (event) => {
+    if (isAuthorizedSender(event)) toggleMenuWindow();
   };
-  const onCloseMenu = () => {
-    closeMenuWindow();
+  const onCloseMenu = (event) => {
+    if (isAuthorizedSender(event)) closeMenuWindow();
   };
 
-  ipcMain.on('taskbar-drawer:toggle', onToggleDrawer);
-  ipcMain.on('taskbar-drawer:expand', onExpandDrawer);
-  ipcMain.on('taskbar-drawer:collapse', onCollapseDrawer);
-  ipcMain.on('taskbar-drawer:animation-done', onAnimationDone);
-  ipcMain.on('taskbar-drawer:playback-action', onPlaybackAction);
-  ipcMain.on('taskbar-drawer:toggle-menu', onToggleMenu);
-  ipcMain.on('taskbar-drawer:close-menu', onCloseMenu);
+  const onAssertTop = (event) => {
+    if (isAuthorizedSender(event)) assertTopmost();
+  };
+
+  ipcMain.on('taskbar-lyrics:toggle', onToggleDrawer);
+  ipcMain.on('taskbar-lyrics:expand', onExpandDrawer);
+  ipcMain.on('taskbar-lyrics:collapse', onCollapseDrawer);
+  ipcMain.on('taskbar-lyrics:animation-done', onAnimationDone);
+  ipcMain.on('taskbar-lyrics:playback-action', onPlaybackAction);
+  ipcMain.on('taskbar-lyrics:toggle-menu', onToggleMenu);
+  ipcMain.on('taskbar-lyrics:close-menu', onCloseMenu);
+  ipcMain.on('taskbar-lyrics:assert-top', onAssertTop);
 
   // Screen metrics listener
   const onDisplayMetricsChanged = () => {
@@ -511,12 +469,12 @@ module.exports = function activate(api) {
 
   // Register RPC for renderer client (`client.mjs`)
   api.rpc.handle('syncSnapshot', (snapshot) => {
-    latestSnapshot = snapshot;
+    latestSnapshot = { ...latestSnapshot, ...snapshot };
     if (taskbarWindow && !taskbarWindow.isDestroyed()) {
-      taskbarWindow.webContents.send('taskbar-drawer:snapshot', snapshot);
+      taskbarWindow.webContents.send('taskbar-lyrics:snapshot', snapshot);
     }
     if (menuWindow && !menuWindow.isDestroyed() && menuWindow.isVisible()) {
-      menuWindow.webContents.send('taskbar-drawer:snapshot', snapshot);
+      menuWindow.webContents.send('taskbar-lyrics:snapshot', snapshot);
     }
     return true;
   });
@@ -535,35 +493,15 @@ module.exports = function activate(api) {
     isExpanded: isDrawerExpanded,
   }));
 
-  // Register Global Tray Menu Controller
-  global.__taskbarLyricsController = {
-    isOpen: () => Boolean(taskbarWindow && !taskbarWindow.isDestroyed() && isEnabled),
-    isEnabled: () => isEnabled,
-    isDrawerExpanded: () => isDrawerExpanded,
-    toggle: () => {
-      if (isEnabled) {
-        disableTaskbarLyrics();
-      } else {
-        enableTaskbarLyrics();
-      }
-    },
-    expand: () => expandDrawer(),
-    collapse: () => collapseDrawer(),
-  };
-
-  if (typeof global.__refreshTrayMenu === 'function') {
-    global.__refreshTrayMenu();
-  }
-
   // Initialize the taskbar window
   createWindow();
 
-  // Active Z-order watchdog: keep taskbarWindow above Shell_TrayWnd even after clicks on taskbar
+  // Active Z-order watchdog for Windows: keeps taskbarWindow and left toggle button above Shell_TrayWnd
   const topmostKeepAliveTimer = setInterval(() => {
     if (taskbarWindow && !taskbarWindow.isDestroyed() && isEnabled) {
       assertTopmost();
     }
-  }, 450);
+  }, 500);
 
   // Lifecycle teardown
   api.lifecycle.onDeactivate(() => {
@@ -572,19 +510,14 @@ module.exports = function activate(api) {
     if (collapseTimer) clearTimeout(collapseTimer);
     if (blurDebounceTimer) clearTimeout(blurDebounceTimer);
     screen.removeListener('display-metrics-changed', onDisplayMetricsChanged);
-    ipcMain.removeListener('taskbar-drawer:toggle', onToggleDrawer);
-    ipcMain.removeListener('taskbar-drawer:expand', onExpandDrawer);
-    ipcMain.removeListener('taskbar-drawer:collapse', onCollapseDrawer);
-    ipcMain.removeListener('taskbar-drawer:animation-done', onAnimationDone);
-    ipcMain.removeListener('taskbar-drawer:playback-action', onPlaybackAction);
-    ipcMain.removeListener('taskbar-drawer:toggle-menu', onToggleMenu);
-    ipcMain.removeListener('taskbar-drawer:close-menu', onCloseMenu);
-
-    global.__taskbarLyricsController = null;
-    Menu.buildFromTemplate = originalBuildFromTemplate;
-    if (typeof global.__refreshTrayMenu === 'function') {
-      global.__refreshTrayMenu();
-    }
+    ipcMain.removeListener('taskbar-lyrics:toggle', onToggleDrawer);
+    ipcMain.removeListener('taskbar-lyrics:expand', onExpandDrawer);
+    ipcMain.removeListener('taskbar-lyrics:collapse', onCollapseDrawer);
+    ipcMain.removeListener('taskbar-lyrics:animation-done', onAnimationDone);
+    ipcMain.removeListener('taskbar-lyrics:playback-action', onPlaybackAction);
+    ipcMain.removeListener('taskbar-lyrics:toggle-menu', onToggleMenu);
+    ipcMain.removeListener('taskbar-lyrics:close-menu', onCloseMenu);
+    ipcMain.removeListener('taskbar-lyrics:assert-top', onAssertTop);
 
     if (menuWindow && !menuWindow.isDestroyed()) {
       menuWindow.close();

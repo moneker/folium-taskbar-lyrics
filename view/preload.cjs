@@ -5,25 +5,26 @@ const { contextBridge, ipcRenderer } = require('electron');
 // enabling snapshot consumption, drawer state coordination, and playback controls.
 
 contextBridge.exposeInMainWorld('taskbarBridge', {
-  toggleDrawer: () => ipcRenderer.send('taskbar-drawer:toggle'),
-  expandDrawer: () => ipcRenderer.send('taskbar-drawer:expand'),
-  collapseDrawer: () => ipcRenderer.send('taskbar-drawer:collapse'),
+  assertTop: () => ipcRenderer.send('taskbar-lyrics:assert-top'),
+  toggleDrawer: () => ipcRenderer.send('taskbar-lyrics:toggle'),
+  expandDrawer: () => ipcRenderer.send('taskbar-lyrics:expand'),
+  collapseDrawer: () => ipcRenderer.send('taskbar-lyrics:collapse'),
   onDrawerState: (callback) => {
     const handler = (_event, state) => callback(state);
-    ipcRenderer.on('taskbar-drawer:state', handler);
-    return () => ipcRenderer.removeListener('taskbar-drawer:state', handler);
+    ipcRenderer.on('taskbar-lyrics:state', handler);
+    return () => ipcRenderer.removeListener('taskbar-lyrics:state', handler);
   },
   notifyAnimationComplete: (state) => {
-    ipcRenderer.send('taskbar-drawer:animation-done', state);
+    ipcRenderer.send('taskbar-lyrics:animation-done', state);
   },
   onSnapshot: (callback) => {
     const handler = (_event, snapshot) => callback(snapshot);
-    ipcRenderer.on('taskbar-drawer:snapshot', handler);
-    return () => ipcRenderer.removeListener('taskbar-drawer:snapshot', handler);
+    ipcRenderer.on('taskbar-lyrics:snapshot', handler);
+    return () => ipcRenderer.removeListener('taskbar-lyrics:snapshot', handler);
   },
-  toggleMenu: () => ipcRenderer.send('taskbar-drawer:toggle-menu'),
-  closeMenu: () => ipcRenderer.send('taskbar-drawer:close-menu'),
+  toggleMenu: () => ipcRenderer.send('taskbar-lyrics:toggle-menu'),
+  closeMenu: () => ipcRenderer.send('taskbar-lyrics:close-menu'),
   sendPlaybackAction: (action, payload) => {
-    ipcRenderer.send('taskbar-drawer:playback-action', { action, payload });
+    ipcRenderer.send('taskbar-lyrics:playback-action', { action, payload });
   },
 });

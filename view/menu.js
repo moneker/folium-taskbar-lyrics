@@ -79,21 +79,23 @@
     });
 
     volumeSlider.addEventListener('change', (e) => {
-      isDraggingSlider = false;
       const val = Math.max(0, Math.min(100, Number(e.target.value) || 0));
+      if (volumePercent) {
+        volumePercent.textContent = `${val}%`;
+      }
       bridge.sendPlaybackAction('setVolume', val);
     });
 
-    const volContainer = volumeSlider.closest('.volume-control-row');
+    const volContainer = volumeSlider.closest('.volume-row') || volumeSlider.closest('.volume-control-row');
     if (volContainer) {
       volContainer.addEventListener('wheel', (e) => {
         e.preventDefault();
-        const current = Number(volumeSlider.value) || 0;
         const step = e.deltaY < 0 ? 5 : -5;
-        const next = Math.max(0, Math.min(100, current + step));
-        volumeSlider.value = next;
-        if (volumePercent) volumePercent.textContent = `${next}%`;
-        bridge.sendPlaybackAction('setVolume', next);
+        const currentVal = Number(volumeSlider.value) || 0;
+        const nextVal = Math.max(0, Math.min(100, currentVal + step));
+        volumeSlider.value = nextVal;
+        if (volumePercent) volumePercent.textContent = `${nextVal}%`;
+        bridge.sendPlaybackAction('setVolume', nextVal);
       }, { passive: false });
     }
   }
@@ -192,21 +194,42 @@
     }
   }
 
+  // State cache to prevent partial deltas (e.g. progress ticks) from wiping queue/mode/volume
+  const state = {
+    queue: [],
+    loopMode: 'all',
+    volume: 100,
+    isMuted: false,
+  };
+
   // Subscribe to snapshot data from bridge
   bridge.onSnapshot((data) => {
     if (!data) return;
 
-    // 1. Queue list & count
-    const queue = data.queue || [];
-    if (queueCount) {
-      queueCount.textContent = `${queue.length} 首`;
+    // 1. Queue list & count (preserve if not sent in delta)
+    if (Array.isArray(data.queue)) {
+      state.queue = data.queue;
+      if (queueCount) {
+        queueCount.textContent = `${state.queue.length} 首`;
+      }
+      renderQueue(state.queue);
     }
-    renderQueue(queue);
 
     // 2. Loop Mode
-    updateLoopMode(data.loopMode || 'all');
+    if (typeof data.loopMode === 'string') {
+      state.loopMode = data.loopMode;
+      updateLoopMode(state.loopMode);
+    }
 
     // 3. Volume
-    updateVolume(data.volume, Boolean(data.isMuted));
+    if (data.volume !== undefined || data.isMuted !== undefined) {
+      if (typeof data.volume === 'number' && Number.isFinite(data.volume)) {
+        state.volume = data.volume;
+      }
+      if (typeof data.isMuted === 'boolean') {
+        state.isMuted = data.isMuted;
+      }
+      updateVolume(state.volume, state.isMuted);
+    }
   });
 })();
