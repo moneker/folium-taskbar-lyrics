@@ -21,6 +21,9 @@ export default function activate(folium) {
 
   folium.log.info(`Taskbar Lyrics Drawer client activating for mod ${folium.modId}`);
 
+  // Feature detection: Folium 1.5+ provides native volume, loop mode and queue controls
+  const hasPlaybackControls = (folium.host?.folium?.minor ?? 0) >= 5;
+
   let currentSnapshot = {
     song: null,
     playerState: 'paused',
@@ -37,6 +40,7 @@ export default function activate(folium) {
       showTranslation: true,
       useCoverBackground: true,
     },
+    hasPlaybackControls,
   };
 
   function normalizePlayerState(raw) {
@@ -63,19 +67,35 @@ export default function activate(folium) {
     }
   }
 
-  // Refresh play queue and lyric offset from playback store
+  /**
+   * Refreshes the play queue using Folium 1.5 getQueue API,
+   * with backward-compatible fallback for earlier host versions.
+   */
   function refreshQueue() {
     try {
-      const pState = folium.internals?.stores?.playback?.getState?.();
-      if (pState) {
-        currentSnapshot.lyricOffsetMs = Number.isFinite(pState.lyricTimelineOffsetMs) ? pState.lyricTimelineOffsetMs : 0;
-        const currentSong = pState.currentSong;
-        currentSnapshot.queue = (pState.playQueue || []).map((s, idx) => ({
-          index: idx,
-          title: s.name || s.title || '未知曲目',
-          artist: (s.artists || []).map((a) => a?.name).filter(Boolean).join(' / ') || s.artist || '未知艺人',
-          active: currentSong ? (s.id === currentSong.id || s === currentSong) : false,
-        }));
+      if (hasPlaybackControls && typeof folium.playback.getQueue === 'function') {
+        const page = folium.playback.getQueue({ limit: 100 });
+        if (page && Array.isArray(page.items)) {
+          currentSnapshot.queue = page.items.map((item) => ({
+            index: item.index,
+            ref: item.song?.ref || null,
+            title: item.song?.title || '未知曲目',
+            artist: item.song?.artist || '未知艺人',
+            active: item.index === page.currentIndex,
+          }));
+        }
+      } else {
+        const pState = folium.internals?.stores?.playback?.getState?.();
+        if (pState) {
+          const currentSong = pState.currentSong;
+          currentSnapshot.queue = (pState.playQueue || []).map((s, idx) => ({
+            index: idx,
+            ref: null,
+            title: s.name || s.title || '未知曲目',
+            artist: (s.artists || []).map((a) => a?.name).filter(Boolean).join(' / ') || s.artist || '未知艺人',
+            active: currentSong ? (s.id === currentSong.id || s === currentSong) : false,
+          }));
+        }
       }
     } catch {
       // Ignored
@@ -93,7 +113,7 @@ export default function activate(folium) {
           currentSnapshot.song = {
             title: state.song.title || '未知曲目',
             artist: state.song.artist || 'Folia',
-            coverUrl: state.song.coverUrl || null,
+            coverUrl: currentSnapshot.song?.coverUrl || null,
           };
         }
         currentSnapshot.playerState = normalizePlayerState(state.state);
@@ -107,6 +127,29 @@ export default function activate(folium) {
       }
     } catch {
       // Ignored
+    }
+  }
+
+  /**
+   * Reads initial audio volume, mute, and loop mode from Folium 1.5 playback API.
+   */
+  function refreshAudioState() {
+    if (hasPlaybackControls) {
+      try {
+        const volInfo = folium.playback.getVolume();
+        if (volInfo) {
+          currentSnapshot.volume = Math.round((volInfo.volume ?? 1) * 100);
+          currentSnapshot.isMuted = Boolean(volInfo.muted);
+        }
+      } catch {}
+      try {
+        const mode = folium.playback.getLoopMode();
+        if (mode) {
+          if (!(currentSnapshot.loopMode === 'shuffle' && mode === 'all')) {
+            currentSnapshot.loopMode = mode;
+          }
+        }
+      } catch {}
     }
   }
 
@@ -178,7 +221,7 @@ export default function activate(folium) {
       currentSnapshot.song = {
         title: event.song.title || '未知曲目',
         artist: event.song.artist || 'Folia',
-        coverUrl: event.song.coverUrl || null,
+        coverUrl: currentSnapshot.song?.coverUrl || null,
       };
     }
     refreshQueue();
@@ -193,11 +236,13 @@ export default function activate(folium) {
   }));
 
   // 2. Playback state changed (playing, paused, stopped)
+  // Direct reading of event.state string and host position/duration to eliminate UI flash
   unsubs.push(folium.events.on('playback.stateChanged', (event) => {
-    if (event?.state) {
-      const nextState = normalizePlayerState(event.state.state);
-      const nextPos = typeof event.state.position === 'number' ? event.state.position : currentSnapshot.currentTime;
-      const nextDur = typeof event.state.duration === 'number' && event.state.duration > 0 ? event.state.duration : currentSnapshot.duration;
+    if (event && event.state) {
+      const nextState = normalizePlayerState(event.state);
+      const hostState = folium.playback.getState();
+      const nextPos = typeof hostState?.position === 'number' ? hostState.position : currentSnapshot.currentTime;
+      const nextDur = typeof hostState?.duration === 'number' && hostState.duration > 0 ? hostState.duration : currentSnapshot.duration;
       currentSnapshot.playerState = nextState;
       currentSnapshot.currentTime = nextPos;
       currentSnapshot.duration = nextDur;
@@ -244,151 +289,44 @@ export default function activate(folium) {
     }
   }));
 
-  // Dynamic resolution of host useAudioSettingsStore
-  let audioSettingsStore = null;
-  let audioSettingsInitPromise = null;
-
-  async function resolveAudioSettingsStore() {
-    // 1. First priority: check folium.internals
-    try {
-      const s = folium.internals?.stores?.audioSettings;
-      if (s?.getState && typeof s.getState().handleSetVolume === 'function') {
-        return s;
+  // 5. Folium 1.5 Playback Event Subscriptions
+  if (hasPlaybackControls) {
+    unsubs.push(folium.events.on('playback.volumeChanged', (event) => {
+      if (event) {
+        currentSnapshot.volume = Math.round((event.volume ?? 1) * 100);
+        currentSnapshot.isMuted = Boolean(event.muted);
+        void pushSnapshot({
+          volume: currentSnapshot.volume,
+          isMuted: currentSnapshot.isMuted,
+        });
       }
-    } catch {}
+    }));
 
-    // 2. Locate the loaded useAudioSettingsStore chunk from performance resource timing or document
-    try {
-      let scriptUrl = null;
-      if (typeof performance !== 'undefined' && typeof performance.getEntriesByType === 'function') {
-        const entries = performance.getEntriesByType('resource');
-        for (const r of entries) {
-          if (r.name && r.name.includes('useAudioSettingsStore') && r.name.endsWith('.js')) {
-            scriptUrl = r.name;
-            break;
-          }
+    unsubs.push(folium.events.on('playback.loopModeChanged', (event) => {
+      if (event && event.mode) {
+        if (!(currentSnapshot.loopMode === 'shuffle' && event.mode === 'all')) {
+          currentSnapshot.loopMode = event.mode;
+          void pushSnapshot({ loopMode: event.mode });
         }
       }
+    }));
 
-      if (!scriptUrl && typeof document !== 'undefined') {
-        const el = document.querySelector('link[href*="useAudioSettingsStore"], script[src*="useAudioSettingsStore"]');
-        if (el) {
-          scriptUrl = el.href || el.src;
-        }
-      }
-
-      if (!scriptUrl && typeof window !== 'undefined' && window.location) {
-        scriptUrl = new URL('./assets/useAudioSettingsStore-Dsrh8mUm.js', window.location.href).href;
-      }
-
-      if (scriptUrl) {
-        const mod = await import(/* @vite-ignore */ scriptUrl);
-        for (const key of Object.keys(mod)) {
-          const val = mod[key];
-          if (val && typeof val.getState === 'function') {
-            const st = val.getState();
-            if (st && typeof st.handleSetVolume === 'function' && typeof st.handleToggleLoopMode === 'function') {
-              return val;
-            }
-          }
-        }
-      }
-    } catch (err) {
-      folium.log.warn('Could not resolve audio settings store dynamically', err);
-    }
-
-    return null;
+    unsubs.push(folium.events.on('playback.queueChanged', () => {
+      refreshQueue();
+      void pushSnapshot({ queue: currentSnapshot.queue });
+    }));
   }
 
-  // Initial read from localStorage cache for instant UI response before async import completes
-  try {
-    if (typeof localStorage !== 'undefined') {
-      const savedVol = localStorage.getItem('player_volume');
-      if (savedVol !== null && Number.isFinite(Number(savedVol))) {
-        currentSnapshot.volume = Math.round(Math.max(0, Math.min(1, Number(savedVol))) * 100);
-      }
-      const savedLoop = localStorage.getItem('player_loop_mode');
-      if (savedLoop) {
-        currentSnapshot.loopMode = savedLoop;
-      }
-      const savedMute = localStorage.getItem('player_is_muted');
-      if (savedMute !== null) {
-        currentSnapshot.isMuted = savedMute === 'true';
-      }
-    }
-  } catch {}
-
-  function refreshAudioSettings() {
-    if (!audioSettingsStore?.getState) return;
-    try {
-      const state = audioSettingsStore.getState();
-      if (typeof state?.volume === 'number') {
-        currentSnapshot.volume = Math.round(state.volume * 100);
-      }
-      if (typeof state?.isMuted === 'boolean') {
-        currentSnapshot.isMuted = state.isMuted;
-      }
-      if (state?.loopMode) {
-        if (!(currentSnapshot.loopMode === 'shuffle' && state.loopMode === 'all')) {
-          currentSnapshot.loopMode = state.loopMode;
-        }
-      }
-    } catch {
-      // Ignored
-    }
-  }
-
-  function getAudioSettings() {
-    if (audioSettingsStore) return Promise.resolve(audioSettingsStore);
-    if (!audioSettingsInitPromise) {
-      audioSettingsInitPromise = resolveAudioSettingsStore().then((store) => {
-        if (store) {
-          audioSettingsStore = store;
-          refreshAudioSettings();
-          void pushSnapshot({
-            volume: currentSnapshot.volume,
-            isMuted: currentSnapshot.isMuted,
-            loopMode: currentSnapshot.loopMode,
-          });
-
-          if (store.subscribe) {
-            const unsub = store.subscribe((state) => {
-              if (!state) return;
-              const vol = typeof state.volume === 'number' ? Math.round(state.volume * 100) : currentSnapshot.volume;
-              const muted = typeof state.isMuted === 'boolean' ? state.isMuted : currentSnapshot.isMuted;
-              let mode = state.loopMode || currentSnapshot.loopMode;
-              if (currentSnapshot.loopMode === 'shuffle' && state.loopMode === 'all') {
-                mode = 'shuffle';
-              }
-              if (vol !== currentSnapshot.volume || muted !== currentSnapshot.isMuted || mode !== currentSnapshot.loopMode) {
-                currentSnapshot.volume = vol;
-                currentSnapshot.isMuted = muted;
-                currentSnapshot.loopMode = mode;
-                void pushSnapshot({
-                  volume: vol,
-                  isMuted: muted,
-                  loopMode: mode,
-                });
-              }
-            });
-            unsubs.push(unsub);
-          }
-        }
-        return store;
-      });
-    }
-    return audioSettingsInitPromise;
-  }
-
-  // Kick off resolution immediately
-  void getAudioSettings();
-
-  // Direct subscription to Zustand playback store for instant queue and offset synchronization
+  // Subscribe to Zustand stores.playback for lyric timeline offset and cover URL
   try {
     const pStore = folium.internals?.stores?.playback;
     if (pStore?.subscribe) {
       const unsubStore = pStore.subscribe((state) => {
-        refreshQueue();
+        if (!state) return;
+        if (Number.isFinite(state.lyricTimelineOffsetMs) && state.lyricTimelineOffsetMs !== currentSnapshot.lyricOffsetMs) {
+          currentSnapshot.lyricOffsetMs = state.lyricTimelineOffsetMs;
+          void pushSnapshot({ lyricOffsetMs: currentSnapshot.lyricOffsetMs });
+        }
         const cover = state.transitionDisplay?.coverUrl
           || state.cachedCoverUrl
           || state.currentSong?.album?.coverUrl
@@ -427,9 +365,26 @@ export default function activate(folium) {
   }));
 
   // Initial synchronization
-  refreshAudioSettings();
+  refreshAudioState();
   refreshPlaybackState();
   refreshQueue();
+  try {
+    const pState = folium.internals?.stores?.playback?.getState?.();
+    if (pState) {
+      if (Number.isFinite(pState.lyricTimelineOffsetMs)) {
+        currentSnapshot.lyricOffsetMs = pState.lyricTimelineOffsetMs;
+      }
+      const cover = pState.transitionDisplay?.coverUrl
+        || pState.cachedCoverUrl
+        || pState.currentSong?.album?.coverUrl
+        || pState.currentSong?.coverUrl
+        || pState.currentSong?.picUrl
+        || null;
+      if (cover && currentSnapshot.song) {
+        currentSnapshot.song.coverUrl = cover;
+      }
+    }
+  } catch {}
   void pushSnapshot(currentSnapshot);
 
   // Periodic poll: sync playback position and drain user actions from taskbar window
@@ -495,147 +450,100 @@ export default function activate(folium) {
             case 'setVolume':
               if (typeof item.payload === 'number') {
                 const ratio = Math.max(0, Math.min(1, item.payload / 100));
-                let handled = false;
-                try {
-                  const aStore = await getAudioSettings();
-                  if (aStore?.getState) {
-                    const st = aStore.getState();
-                    if (typeof st.handleSetVolume === 'function') {
-                      st.handleSetVolume(ratio);
-                      handled = true;
-                    } else if (typeof aStore.setState === 'function') {
-                      aStore.setState({ volume: ratio });
-                      if (typeof localStorage !== 'undefined') {
-                        localStorage.setItem('player_volume', String(ratio));
-                      }
-                      handled = true;
+                if (hasPlaybackControls) {
+                  try {
+                    folium.playback.setVolume(ratio);
+                    if (currentSnapshot.isMuted) {
+                      folium.playback.setMuted(false);
                     }
-                    if (st.isMuted && typeof st.handleToggleMute === 'function') {
-                      st.handleToggleMute();
-                    }
+                  } catch (err) {
+                    folium.log.warn('Failed to setVolume', err);
                   }
-                } catch {
-                  // Ignored
+                } else {
+                  folium.ui.openVolume();
                 }
                 currentSnapshot.volume = Math.round(ratio * 100);
                 void pushSnapshot({ volume: currentSnapshot.volume });
-                if (!handled) {
-                  folium.ui.openVolume();
-                }
               }
               break;
-            case 'toggleMute': {
-              let handled = false;
-              try {
-                const aStore = await getAudioSettings();
-                if (aStore?.getState) {
-                  const st = aStore.getState();
-                  if (typeof st.handleToggleMute === 'function') {
-                    st.handleToggleMute();
-                    handled = true;
-                  } else if (typeof aStore.setState === 'function') {
-                    const next = !st.isMuted;
-                    aStore.setState({ isMuted: next });
-                    if (typeof localStorage !== 'undefined') {
-                      localStorage.setItem('player_is_muted', String(next));
-                    }
-                    handled = true;
-                  }
+            case 'toggleMute':
+              if (hasPlaybackControls) {
+                try {
+                  const nextMuted = !folium.playback.getVolume().muted;
+                  folium.playback.setMuted(nextMuted);
+                  currentSnapshot.isMuted = nextMuted;
+                  void pushSnapshot({ isMuted: nextMuted });
+                } catch (err) {
+                  folium.log.warn('Failed to toggleMute', err);
                 }
-              } catch {
-                // Ignored
-              }
-              if (!handled) {
-                currentSnapshot.isMuted = !currentSnapshot.isMuted;
-                void pushSnapshot({ isMuted: currentSnapshot.isMuted });
+              } else {
                 folium.ui.openVolume();
               }
               break;
-            }
-            case 'toggleLoopMode': {
-              const current = currentSnapshot.loopMode || 'all';
-              let nextMode = 'all';
-              if (current === 'all') {
-                nextMode = 'shuffle';
-              } else if (current === 'shuffle') {
-                nextMode = 'one';
-              } else if (current === 'one') {
-                nextMode = 'off';
-              } else {
-                nextMode = 'all';
-              }
+            case 'toggleLoopMode':
+              if (hasPlaybackControls) {
+                const current = currentSnapshot.loopMode || 'all';
+                let nextMode = 'all';
+                if (current === 'all') {
+                  nextMode = 'shuffle';
+                } else if (current === 'shuffle') {
+                  nextMode = 'one';
+                } else if (current === 'one') {
+                  nextMode = 'off';
+                } else {
+                  nextMode = 'all';
+                }
 
-              currentSnapshot.loopMode = nextMode;
-              void pushSnapshot({ loopMode: nextMode });
+                currentSnapshot.loopMode = nextMode;
+                void pushSnapshot({ loopMode: nextMode });
 
-              try {
-                if (nextMode === 'shuffle') {
-                  folium.playback.shuffleQueue();
-                  const aStore = await getAudioSettings();
-                  if (typeof aStore?.setState === 'function') {
-                    aStore.setState({ loopMode: 'all' });
+                try {
+                  if (nextMode === 'shuffle') {
+                    folium.playback.shuffleQueue();
+                    folium.playback.setLoopMode('all');
+                  } else {
+                    folium.playback.setLoopMode(nextMode);
                   }
-                  if (typeof localStorage !== 'undefined') {
-                    localStorage.setItem('player_loop_mode', 'all');
+                } catch (err) {
+                  folium.log.warn('Failed to apply loop mode change', err);
+                }
+              } else {
+                try {
+                  folium.ui.toast('循环模式切换需 Folium 1.5 接口支持（随 Folia 下个版本发布）', { type: 'info', durationMs: 2500 });
+                } catch {}
+              }
+              break;
+            case 'playQueueIndex': {
+              const payload = item.payload;
+              const index = typeof payload === 'number' ? payload : payload?.index;
+              const ref = typeof payload === 'object' ? payload?.ref : undefined;
+              if (typeof index === 'number') {
+                if (hasPlaybackControls) {
+                  try {
+                    const played = await folium.playback.playQueueItem(index, ref || undefined);
+                    if (!played) {
+                      refreshQueue();
+                      void pushSnapshot({ queue: currentSnapshot.queue });
+                    }
+                  } catch (err) {
+                    folium.log.warn('playQueueItem failed', err);
                   }
                 } else {
-                  const aStore = await getAudioSettings();
-                  if (typeof aStore?.setState === 'function') {
-                    aStore.setState({ loopMode: nextMode });
-                  }
-                  if (typeof localStorage !== 'undefined') {
-                    localStorage.setItem('player_loop_mode', nextMode);
-                  }
+                  try {
+                    folium.ui.openPlayerPanel('queue');
+                    folium.ui.toast('队列点播需 Folium 1.5 接口支持（随 Folia 下个版本发布），已为你打开主播放列表', { type: 'info', durationMs: 2500 });
+                  } catch {}
                 }
-              } catch (err) {
-                folium.log.warn('Failed to apply loop mode change', err);
               }
               break;
             }
-            case 'playQueueIndex':
-              if (typeof item.payload === 'number') {
-                try {
-                  const pStore = folium.internals?.stores?.playback?.getState?.();
-                  const queue = pStore?.playQueue || [];
-                  const targetSong = queue[item.payload];
-                  let played = false;
-                  if (targetSong) {
-                    try {
-                      if (typeof folium.internals?.toFoliumSong === 'function') {
-                        const fSong = folium.internals.toFoliumSong(targetSong);
-                        if (fSong) {
-                          await folium.playback.playSong(fSong);
-                          played = true;
-                        }
-                      }
-                    } catch {
-                      // Ignored
-                    }
-                  }
-                  if (!played) {
-                    const currentSong = pStore?.currentSong;
-                    const currentIdx = queue.findIndex(s => s && currentSong && (s.id === currentSong.id || s === currentSong));
-                    if (currentIdx !== -1) {
-                      const diff = item.payload - currentIdx;
-                      if (diff > 0) {
-                        for (let i = 0; i < diff; i++) folium.playback.next();
-                      } else if (diff < 0) {
-                        for (let i = 0; i < Math.abs(diff); i++) folium.playback.previous();
-                      }
-                    }
-                  }
-                } catch {
-                  // Ignored
-                }
-              }
-              break;
           }
         }
       }
     } catch {
       // Ignored
     }
-  }, 160);
+  }, 250);
 
   // Return Disposer
   return () => {

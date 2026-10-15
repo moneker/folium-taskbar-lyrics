@@ -96,8 +96,47 @@ module.exports = function activate(api) {
   let collapseTimer = null;
   let blurDebounceTimer = null;
 
+  // Initialize playback snapshot from api.runtime if host has playback running
+  try {
+    if (api.runtime && typeof api.runtime.getPlaybackSnapshot === 'function') {
+      const snap = api.runtime.getPlaybackSnapshot();
+      if (snap) {
+        latestSnapshot = {
+          song: snap.song ? {
+            title: snap.song.title || '未知曲目',
+            artist: snap.song.artist || 'Folia',
+            coverUrl: null,
+          } : null,
+          playerState: snap.state || 'paused',
+          currentTime: typeof snap.position === 'number' ? snap.position : 0,
+          duration: typeof snap.duration === 'number' ? snap.duration : 0,
+          volume: typeof snap.volume === 'number' ? Math.round(snap.volume * 100) : 100,
+          isMuted: Boolean(snap.muted),
+          loopMode: snap.loopMode || 'all',
+          updatedAt: Date.now(),
+          lyrics: Array.isArray(snap.lines) && snap.lines.length > 0 ? {
+            lines: snap.lines.map((line) => ({
+              startTime: line.startTime,
+              endTime: line.endTime,
+              fullText: line.fullText || line.text || '',
+              text: line.text || '',
+              translation: line.translation || '',
+              words: Array.isArray(line.words) ? line.words.map((w) => ({
+                text: w.text,
+                startTime: w.startTime,
+                endTime: w.endTime,
+              })) : null,
+            })),
+          } : null,
+        };
+      }
+    }
+  } catch (err) {
+    api.log.warn('Could not read initial playback snapshot from api.runtime', err);
+  }
+
   /**
-   * Asserts the window to floating level without aggressive screen-saver takeover.
+   * Asserts the window to floating level above Windows taskbar (Shell_TrayWnd).
    */
   function assertTopmost() {
     if (!taskbarWindow || taskbarWindow.isDestroyed() || !isEnabled) return;
@@ -501,7 +540,7 @@ module.exports = function activate(api) {
     if (taskbarWindow && !taskbarWindow.isDestroyed() && isEnabled) {
       assertTopmost();
     }
-  }, 500);
+  }, 1000);
 
   // Lifecycle teardown
   api.lifecycle.onDeactivate(() => {

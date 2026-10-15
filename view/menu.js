@@ -70,15 +70,25 @@
       isDraggingSlider = false;
     });
 
+    let volumeThrottleTimer = null;
     volumeSlider.addEventListener('input', (e) => {
       const val = Math.max(0, Math.min(100, Number(e.target.value) || 0));
       if (volumePercent) {
         volumePercent.textContent = `${val}%`;
       }
-      bridge.sendPlaybackAction('setVolume', val);
+      if (!volumeThrottleTimer) {
+        volumeThrottleTimer = setTimeout(() => {
+          volumeThrottleTimer = null;
+          bridge.sendPlaybackAction('setVolume', val);
+        }, 120);
+      }
     });
 
     volumeSlider.addEventListener('change', (e) => {
+      if (volumeThrottleTimer) {
+        clearTimeout(volumeThrottleTimer);
+        volumeThrottleTimer = null;
+      }
       const val = Math.max(0, Math.min(100, Number(e.target.value) || 0));
       if (volumePercent) {
         volumePercent.textContent = `${val}%`;
@@ -88,6 +98,7 @@
 
     const volContainer = volumeSlider.closest('.volume-row') || volumeSlider.closest('.volume-control-row');
     if (volContainer) {
+      let wheelDebounceTimer = null;
       volContainer.addEventListener('wheel', (e) => {
         e.preventDefault();
         const step = e.deltaY < 0 ? 5 : -5;
@@ -95,7 +106,10 @@
         const nextVal = Math.max(0, Math.min(100, currentVal + step));
         volumeSlider.value = nextVal;
         if (volumePercent) volumePercent.textContent = `${nextVal}%`;
-        bridge.sendPlaybackAction('setVolume', nextVal);
+        if (wheelDebounceTimer) clearTimeout(wheelDebounceTimer);
+        wheelDebounceTimer = setTimeout(() => {
+          bridge.sendPlaybackAction('setVolume', nextVal);
+        }, 150);
       }, { passive: false });
     }
   }
@@ -111,7 +125,7 @@
     }
 
     // Performance check: avoid rewriting DOM if queue content & active state haven't changed
-    const currentQueueJson = JSON.stringify(queue.map(q => ({ i: q.index, t: q.title, a: q.artist, act: q.active })));
+    const currentQueueJson = JSON.stringify(queue.map(q => ({ i: q.index, r: q.ref, t: q.title, a: q.artist, act: q.active })));
     if (currentQueueJson === lastQueueJson) {
       return;
     }
@@ -130,7 +144,10 @@
       `;
 
       el.addEventListener('click', () => {
-        bridge.sendPlaybackAction('playQueueIndex', item.index !== undefined ? item.index : idx);
+        bridge.sendPlaybackAction('playQueueIndex', {
+          index: item.index !== undefined ? item.index : idx,
+          ref: item.ref || undefined,
+        });
       });
 
       fragment.appendChild(el);
@@ -215,7 +232,13 @@
       renderQueue(state.queue);
     }
 
-    // 2. Loop Mode
+    // 2. Loop Mode (hidden on host minor < 5 per reviewer specification)
+    if (typeof data.hasPlaybackControls === 'boolean') {
+      const modeRow = document.querySelector('.mode-row');
+      if (modeRow) {
+        modeRow.style.display = data.hasPlaybackControls ? 'flex' : 'none';
+      }
+    }
     if (typeof data.loopMode === 'string') {
       state.loopMode = data.loopMode;
       updateLoopMode(state.loopMode);
