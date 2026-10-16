@@ -34,10 +34,10 @@
 
     <!-- Bottom Controls Area -->
     <div class="menu-footer">
-      <!-- Playback Mode -->
+      <!-- Playback Mode & Shuffle -->
       <div class="mode-row">
-        <button id="loopModeBtn" class="mode-btn" type="button" title="切换播放模式">
-          <svg id="loopIconOrder" class="mode-svg" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <button id="loopModeBtn" class="mode-btn" type="button" title="切换播放模式 (列表循环 / 单曲循环 / 顺序播放)">
+          <svg id="loopIconAll" class="mode-svg" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <polyline points="17 1 21 5 17 9"></polyline>
             <path d="M3 11V9a4 4 0 0 1 4-4h14"></path>
             <polyline points="7 23 3 19 7 15"></polyline>
@@ -50,14 +50,24 @@
             <path d="M21 13v2a4 4 0 0 1-4 4H3"></path>
             <text x="12" y="15" font-size="8" font-weight="bold" fill="currentColor" text-anchor="middle">1</text>
           </svg>
-          <svg id="loopIconShuffle" class="mode-svg hidden" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <svg id="loopIconOff" class="mode-svg hidden" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="17 1 21 5 17 9"></polyline>
+            <path d="M3 11V9a4 4 0 0 1 4-4h14"></path>
+            <polyline points="7 23 3 19 7 15"></polyline>
+            <path d="M21 13v2a4 4 0 0 1-4 4H3"></path>
+            <line x1="2" y1="2" x2="22" y2="22" stroke="currentColor" stroke-width="2"></line>
+          </svg>
+          <span id="loopModeLabel" class="mode-label">列表循环</span>
+        </button>
+        <button id="shuffleBtn" class="mode-btn shuffle-btn" type="button" title="随机打乱播放队列">
+          <svg class="mode-svg" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <polyline points="16 3 21 3 21 8"></polyline>
             <line x1="4" y1="20" x2="21" y2="3"></line>
             <polyline points="21 16 21 21 16 21"></polyline>
             <line x1="15" y1="15" x2="21" y2="21"></line>
             <line x1="4" y1="4" x2="9" y2="9"></line>
           </svg>
-          <span id="loopModeLabel" class="mode-label">顺序播放</span>
+          <span class="mode-label">打乱</span>
         </button>
       </div>
 

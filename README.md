@@ -19,7 +19,7 @@
 ## 平台与兼容性
 
 - **运行平台**：Windows 10 / 11（win32）
-- **宿主版本要求**：Folia `>=0.7.19 <0.9.0`
+- **宿主版本要求**：Folia `>=0.7.20 <0.8.0`（基于 Folium 1.5 标准接口）
 
 ## 安装方式
 
@@ -29,19 +29,25 @@
 
 ## 权限声明
 
-- `runtime.playback`: 主进程在模组激活初始化时通过 `api.runtime.getPlaybackSnapshot()` 补齐当前音轨信息、音量、循环模式与歌词，保障冷启动即刻渲染。
-- `playback.control`: 抽屉按键与快捷菜单控制播放/暂停、上一曲/下一曲、进度拖拽、设置音量/静音、切换循环模式与通过 `folium.playback.playQueueItem(index, ref)` 点播队列曲目。
+- `runtime.playback`: 主进程在模组激活初始化时尝试通过 `api.runtime.getPlaybackSnapshot()` 读取当前音轨元数据与状态（在重载或热重启时快速恢复当前进度与歌词）；冷启动渲染端尚未推送时安全回退并等待事件。
+- `playback.control`: 抽屉按键与快捷菜单控制播放/暂停、上一曲/下一曲、进度拖拽、设置音量/静音（`setVolume` / `setMuted`）、切换循环模式（`setLoopMode`）、打乱队列（`shuffleQueue`）与通过 `folium.playback.playQueueItem(index, ref)` 点播队列曲目。
 
 ## 内部接口（Internals）使用声明
 
-本模组在 `mod.json` 中声明了对 `folium.internals` 的受控使用：
-- **`stores.playback`**：仅读取 `lyricTimelineOffsetMs`（用户在 Folia 中调整的歌词时间轴偏移量）与正在播放歌曲的专辑封面 URL（以支持流体流光背景渲染），并调用其 `subscribe` 监听封面与偏移变动。
-- **纯净性与规范**：所有播放控制、音量调节、循环模式与播放队列均已迁移至 Folium 1.5 官方标准接口（`folium.playback.*`），不读写任何宿主私有 localStorage 键，不侵入私有 React 树，并在清单中严格钉住宿主版本 `"folia": ">=0.7.19 <0.9.0"`。
+由于使用 `folium.internals` 的模块没有跨大版本的兼容承诺，本模组在 `mod.json` 中将宿主版本严格锁定在 `"folia": ">=0.7.20 <0.8.0"`。
 
-## 性能与功耗优化
+模组仅在以下位置受控读取 `stores.playback`：
+1. **专辑封面 URL**：读取 `state.transitionDisplay?.coverUrl`、`state.cachedCoverUrl`、`state.currentSong?.album?.coverUrl`、`state.currentSong?.coverUrl`、`state.currentSong?.picUrl`（供抽屉生成流体毛玻璃亚克力背景）；
+2. **歌词时间轴偏移**：读取 `state.lyricTimelineOffsetMs`（用于对齐用户在 Folia 界面手动调节的歌词时延）；
+3. **状态变动订阅**：通过 `folium.internals.stores.playback.subscribe` 仅在上述字段变动时向任务栏窗口推送增量快照。
+
+所有播放控制（播放、暂停、切歌、seek）、音量与静音（`getVolume` / `setVolume` / `setMuted`）、循环模式（`getLoopMode` / `setLoopMode`）、打乱队列（`shuffleQueue`）及队列获取与点播（`getQueue` / `playQueueItem`）均 100% 采用 Folium 1.5 官方标准接口，不包含任何对私有 store 的回退反射，也不读写任何 localStorage 键。
+
+## 运行时与性能说明
 
 - **轻量置顶守护**：Windows 任务栏 Z-order 守护采用 1000ms 轻量级层级保活（仅调用原生层级调整，单次耗时 < 0.05ms），并配合鼠标移入交互即时提升，确保抽屉开关稳定覆盖在系统任务栏上层，空闲与后台时对电池和 CPU 消耗极低。
-- **事件驱动与合并**：音量拖拽在松手（change）与 120ms 节流提交，滚轮调节自动合并防抖（150ms），队列刷新依靠 `playback.queueChanged` 事件驱动，轮询开销极低。
+- **定时同步与排空**：渲染端常驻定时器每 250ms 调用一次 `folium.playback.getState()` 同步播放进度差值，并排空 `drainActions` 用户操作队列；曲目、播放状态、音量、循环模式及队列刷新则完全由 `playback.*Changed` 事件驱动推送。
+- **音量设置合并**：拖动滑块时仅实时更新本地显示数值，在松手（`change`）时才向宿主触发 `setVolume` 避免高频落盘；滚轮调节配备 150ms 防抖合并。
 - **流体封面合成器图层**：亚克力流体背景使用 CSS 合成器层渲染，播放暂停时零多余重绘，对轻薄本与电池设备友好。
 
 ## 许可证

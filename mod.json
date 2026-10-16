@@ -2,7 +2,7 @@
   "folium": 1,
   "id": "taskbar-lyrics",
   "name": "任务栏抽屉歌词",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "author": "moneker",
   "description": "以抽屉式替换模式完全覆盖 Windows 任务栏的沉浸式动态歌词模组（仅限 Windows）。最左侧常驻替换按钮，点击后歌词抽屉从右侧丝滑滑入覆盖任务栏，支持实时逐字歌词、Folia流体封面背景与控制面板。",
   "main": "index.cjs",
@@ -12,5 +12,5 @@
     "runtime.playback",
     "playback.control"
   ],
-  "folia": ">=0.7.19 <0.9.0"
+  "folia": ">=0.7.20 <0.8.0"
 }

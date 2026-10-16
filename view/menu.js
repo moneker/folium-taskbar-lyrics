@@ -16,9 +16,10 @@
   const closeBtn = document.getElementById('closeBtn');
   const queueList = document.getElementById('queueList');
   const loopModeBtn = document.getElementById('loopModeBtn');
-  const loopIconOrder = document.getElementById('loopIconOrder');
+  const shuffleBtn = document.getElementById('shuffleBtn');
+  const loopIconAll = document.getElementById('loopIconAll');
   const loopIconOne = document.getElementById('loopIconOne');
-  const loopIconShuffle = document.getElementById('loopIconShuffle');
+  const loopIconOff = document.getElementById('loopIconOff');
   const loopModeLabel = document.getElementById('loopModeLabel');
   const muteBtn = document.getElementById('muteBtn');
   const volumeHighIcon = document.getElementById('volumeHighIcon');
@@ -53,6 +54,13 @@
     });
   }
 
+  // Shuffle queue click
+  if (shuffleBtn) {
+    shuffleBtn.addEventListener('click', () => {
+      bridge.sendPlaybackAction('shuffleQueue');
+    });
+  }
+
   // Mute button click
   if (muteBtn) {
     muteBtn.addEventListener('click', () => {
@@ -70,25 +78,15 @@
       isDraggingSlider = false;
     });
 
-    let volumeThrottleTimer = null;
     volumeSlider.addEventListener('input', (e) => {
       const val = Math.max(0, Math.min(100, Number(e.target.value) || 0));
       if (volumePercent) {
         volumePercent.textContent = `${val}%`;
       }
-      if (!volumeThrottleTimer) {
-        volumeThrottleTimer = setTimeout(() => {
-          volumeThrottleTimer = null;
-          bridge.sendPlaybackAction('setVolume', val);
-        }, 120);
-      }
+      // Dragging only updates UI display, committing on change to avoid excessive writes
     });
 
     volumeSlider.addEventListener('change', (e) => {
-      if (volumeThrottleTimer) {
-        clearTimeout(volumeThrottleTimer);
-        volumeThrottleTimer = null;
-      }
       const val = Math.max(0, Math.min(100, Number(e.target.value) || 0));
       if (volumePercent) {
         volumePercent.textContent = `${val}%`;
@@ -166,27 +164,23 @@
   function updateLoopMode(mode) {
     if (!loopModeLabel) return;
 
-    if (loopIconOrder) loopIconOrder.classList.add('hidden');
+    if (loopIconAll) loopIconAll.classList.add('hidden');
     if (loopIconOne) loopIconOne.classList.add('hidden');
-    if (loopIconShuffle) loopIconShuffle.classList.add('hidden');
+    if (loopIconOff) loopIconOff.classList.add('hidden');
 
     switch (mode) {
       case 'one':
         if (loopIconOne) loopIconOne.classList.remove('hidden');
         loopModeLabel.textContent = '单曲循环';
         break;
-      case 'all':
-        if (loopIconOrder) loopIconOrder.classList.remove('hidden');
-        loopModeLabel.textContent = '列表循环';
-        break;
-      case 'shuffle':
-        if (loopIconShuffle) loopIconShuffle.classList.remove('hidden');
-        loopModeLabel.textContent = '随机播放';
-        break;
       case 'off':
-      default:
-        if (loopIconOrder) loopIconOrder.classList.remove('hidden');
+        if (loopIconOff) loopIconOff.classList.remove('hidden');
         loopModeLabel.textContent = '顺序播放';
+        break;
+      case 'all':
+      default:
+        if (loopIconAll) loopIconAll.classList.remove('hidden');
+        loopModeLabel.textContent = '列表循环';
         break;
     }
   }
@@ -223,22 +217,17 @@
   bridge.onSnapshot((data) => {
     if (!data) return;
 
-    // 1. Queue list & count (preserve if not sent in delta)
+    // 1. Queue list & count (use full queueTotal from page.length if provided)
     if (Array.isArray(data.queue)) {
       state.queue = data.queue;
+      const count = typeof data.queueTotal === 'number' ? data.queueTotal : state.queue.length;
       if (queueCount) {
-        queueCount.textContent = `${state.queue.length} 首`;
+        queueCount.textContent = `${count} 首`;
       }
       renderQueue(state.queue);
     }
 
-    // 2. Loop Mode (hidden on host minor < 5 per reviewer specification)
-    if (typeof data.hasPlaybackControls === 'boolean') {
-      const modeRow = document.querySelector('.mode-row');
-      if (modeRow) {
-        modeRow.style.display = data.hasPlaybackControls ? 'flex' : 'none';
-      }
-    }
+    // 2. Loop Mode
     if (typeof data.loopMode === 'string') {
       state.loopMode = data.loopMode;
       updateLoopMode(state.loopMode);

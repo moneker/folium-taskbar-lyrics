@@ -220,14 +220,15 @@ html, body {
   flex-shrink: 0;
 }
 
-/* Mode Button */
+/* Mode & Shuffle Buttons */
 .mode-row {
   display: flex;
   align-items: center;
+  gap: 8px;
 }
 
 .mode-btn {
-  width: 100%;
+  flex: 1;
   height: 34px;
   border-radius: 9px;
   background: rgba(255, 255, 255, 0.06);
@@ -236,12 +237,17 @@ html, body {
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 8px;
+  gap: 6px;
   font-size: 12.5px;
   font-weight: 500;
   cursor: pointer;
   transition: all 0.16s ease;
   outline: none;
+}
+
+.shuffle-btn {
+  flex: 0 0 auto;
+  padding: 0 12px;
 }
 
 .mode-btn:hover {
