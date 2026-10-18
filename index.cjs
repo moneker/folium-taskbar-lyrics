@@ -96,6 +96,8 @@ module.exports = function activate(api) {
   let collapseTimer = null;
   let blurDebounceTimer = null;
 
+  let lastMenuBlurTime = 0;
+
   // Initialize playback snapshot from api.runtime if host has playback running
   try {
     if (api.runtime && typeof api.runtime.getPlaybackSnapshot === 'function') {
@@ -113,6 +115,7 @@ module.exports = function activate(api) {
           volume: typeof snap.volume === 'number' ? Math.round(snap.volume * 100) : 100,
           isMuted: Boolean(snap.muted),
           loopMode: snap.loopMode || 'all',
+          theme: snap.theme || null,
           updatedAt: Date.now(),
           lyrics: Array.isArray(snap.lines) && snap.lines.length > 0 ? {
             lines: snap.lines.map((line) => ({
@@ -157,8 +160,8 @@ module.exports = function activate(api) {
 
   function resolveMenuBounds() {
     const bounds = resolveTaskbarBounds();
-    const menuWidth = 330;
-    const menuHeight = 420;
+    const menuWidth = 360;
+    const menuHeight = 460;
     const margin = 12;
     const x = Math.max(0, bounds.x + bounds.width - menuWidth - margin);
     let y = bounds.y - menuHeight - 8;
@@ -216,6 +219,7 @@ module.exports = function activate(api) {
     });
 
     win.on('blur', () => {
+      lastMenuBlurTime = Date.now();
       closeMenuWindow();
     });
 
@@ -242,11 +246,16 @@ module.exports = function activate(api) {
   }
 
   function toggleMenuWindow() {
+    const now = Date.now();
     if (menuWindow && !menuWindow.isDestroyed() && menuWindow.isVisible()) {
       closeMenuWindow();
-    } else {
-      showMenuWindow();
+      return;
     }
+    // Prevent toggle bounce: if the menu just blurred within 350ms, the toggle click caused the blur.
+    if (now - lastMenuBlurTime < 350) {
+      return;
+    }
+    showMenuWindow();
   }
 
   function closeMenuWindow() {

@@ -7,14 +7,19 @@
   <link rel="stylesheet" href="menu.css">
 </head>
 <body>
-  <!-- mods/taskbar-lyrics/view/menu.html: Floating acrylic popup menu for play queue, volume, and loop mode -->
+  <!-- mods/taskbar-lyrics/view/menu.html: Floating acrylic menu with unified breadcrumb navigation (书库 > 歌单 > 具体歌单 > 列表), play queue, and controls -->
   <div id="menuRoot" class="menu-root">
-    <!-- Header -->
+    <!-- Top Header: Breadcrumbs Navigation Bar (书库 > 歌单 > 具体歌单 > 列表) & Close Button -->
     <div class="menu-header">
-      <div class="header-left">
-        <span class="header-title">播放队列</span>
-        <span class="header-dot">·</span>
-        <span id="queueCount" class="header-count">0 首</span>
+      <div class="header-nav-bar">
+        <button id="navBackBtn" class="nav-back-btn hidden" type="button" title="返回上一级">
+          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="15 18 9 12 15 6"></polyline>
+          </svg>
+        </button>
+        <div id="navCrumbs" class="nav-crumbs">
+          <span class="crumb active" data-depth="0">书库</span>
+        </div>
       </div>
       <button id="closeBtn" class="close-btn" type="button" title="关闭菜单">
         <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round">
@@ -24,17 +29,25 @@
       </button>
     </div>
 
-    <!-- Scrollable Play Queue -->
-    <div class="queue-container">
-      <div id="queueList" class="queue-list" role="list">
-        <!-- Rendered dynamically -->
-        <div class="queue-empty">暂无播放队列</div>
+    <!-- Main Content Viewport -->
+    <div class="content-viewport">
+      <!-- Dynamic Top Toolbar (Pagination / Search / Info Badges) -->
+      <div id="viewToolbar" class="view-toolbar hidden">
+        <!-- Dynamically populated per view level -->
+      </div>
+
+      <!-- Scrollable Content Container -->
+      <div id="viewContainer" class="view-container">
+        <!-- Dynamically rendered:
+             - Root: 书库 Categories (播放队列, 歌单, 电台, 专辑, 本地音乐)
+             - Category list: 歌单列表, 专辑列表, 电台入口
+             - Songs list: 歌曲列表 (播放队列, 歌单内歌曲, 专辑内歌曲)
+        -->
       </div>
     </div>
 
-    <!-- Bottom Controls Area -->
+    <!-- Bottom Controls Area: Mode, Shuffle, Volume -->
     <div class="menu-footer">
-      <!-- Playback Mode & Shuffle -->
       <div class="mode-row">
         <button id="loopModeBtn" class="mode-btn" type="button" title="切换播放模式 (列表循环 / 单曲循环 / 顺序播放)">
           <svg id="loopIconAll" class="mode-svg" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
