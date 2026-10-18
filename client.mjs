@@ -997,10 +997,12 @@ export default function activate(folium) {
     ],
   });
 
+  const settingsAccess = settingsSection?.settings;
+
   function syncSettings() {
     try {
-      if (settingsSection?.params?.get) {
-        const values = settingsSection.params.get();
+      if (settingsAccess?.get) {
+        const values = settingsAccess.get();
         const showTr = values?.showTranslation;
         const useBg = values?.useCoverBackground;
         currentSnapshot.settings = {
@@ -1015,8 +1017,8 @@ export default function activate(folium) {
 
   syncSettings();
 
-  if (settingsSection?.params?.subscribe) {
-    settingsSection.params.subscribe(() => {
+  if (typeof settingsAccess?.onChange === 'function') {
+    settingsAccess.onChange(() => {
       syncSettings();
       void pushSnapshot({ settings: currentSnapshot.settings });
     });

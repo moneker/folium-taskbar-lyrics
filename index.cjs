@@ -552,7 +552,7 @@ module.exports = function activate(api) {
   }, 1000);
 
   // Lifecycle teardown
-  api.lifecycle.onDeactivate(() => {
+  const onDispose = () => {
     api.log.info('Deactivating Taskbar Lyrics Drawer mod');
     if (topmostKeepAliveTimer) clearInterval(topmostKeepAliveTimer);
     if (collapseTimer) clearTimeout(collapseTimer);
@@ -576,5 +576,10 @@ module.exports = function activate(api) {
       taskbarWindow.close();
       taskbarWindow = null;
     }
-  });
+  };
+
+  if (typeof api.onDispose === 'function') {
+    api.onDispose(onDispose);
+  }
+  return onDispose;
 };
