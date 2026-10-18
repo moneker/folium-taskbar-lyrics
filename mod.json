@@ -9,7 +9,7 @@
   "client": "client.mjs",
   "preview": "preview.png",
   "permissions": [
-    "playback.read",
+    "runtime.playback",
     "playback.control"
   ],
   "folia": ">=0.7.20 <0.8.0"
