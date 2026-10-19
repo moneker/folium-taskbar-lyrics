@@ -578,8 +578,5 @@ module.exports = function activate(api) {
     }
   };
 
-  if (typeof api.onDispose === 'function') {
-    api.onDispose(onDispose);
-  }
   return onDispose;
 };

@@ -12,5 +12,5 @@
     "runtime.playback",
     "playback.control"
   ],
-  "folia": ">=0.7.20 <0.8.0"
+  "folia": ">=0.7.21 <0.8.0"
 }

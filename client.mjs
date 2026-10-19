@@ -1038,31 +1038,10 @@ export default function activate(folium) {
   let lastAudioSyncPushedTime = -1;
 
   /**
-   * Retrieves the current audio playback position across all available engine sources:
-   * 1. Folia MotionValue signal (__folia_current_time on window)
-   * 2. All HTML5 <audio> elements (Automix Deck A & Deck B)
-   * 3. Folium host bridge playback state
+   * Retrieves the current audio playback position from Folium host bridge playback state.
    */
   function getActiveAudioPosition() {
     try {
-      // 1. Framer motion value exposed by Folia App.tsx
-      if (typeof window !== 'undefined' && window.__folia_current_time && typeof window.__folia_current_time.get === 'function') {
-        const val = window.__folia_current_time.get();
-        if (typeof val === 'number' && Number.isFinite(val)) {
-          return val;
-        }
-      }
-
-      // 2. Query all audio elements (handles automix Deck A and Deck B interchangeably)
-      if (typeof document !== 'undefined') {
-        const audios = Array.from(document.querySelectorAll('audio'));
-        const playing = audios.find((a) => !a.paused && !a.ended && Number.isFinite(a.currentTime) && a.currentTime > 0);
-        if (playing) return playing.currentTime;
-        const valid = audios.find((a) => Number.isFinite(a.currentTime) && a.currentTime > 0);
-        if (valid) return valid.currentTime;
-      }
-
-      // 3. Folium host bridge playback state
       const hostState = folium.playback.getState();
       if (hostState && typeof hostState.position === 'number' && Number.isFinite(hostState.position)) {
         return hostState.position;
@@ -1114,68 +1093,6 @@ export default function activate(folium) {
       // Ignored
     }
   }
-
-  function setupAudioTimeSync() {
-    const attachedAudios = new Set();
-
-    const onAudioEvent = () => {
-      pushPlaybackAnchor(false);
-    };
-
-    const attachAudio = (el) => {
-      if (!el || attachedAudios.has(el)) return;
-      attachedAudios.add(el);
-      el.addEventListener('timeupdate', onAudioEvent);
-      el.addEventListener('seeking', onAudioEvent);
-      el.addEventListener('seeked', onAudioEvent);
-      el.addEventListener('play', onAudioEvent);
-      el.addEventListener('pause', onAudioEvent);
-      el.addEventListener('ratechange', onAudioEvent);
-    };
-
-    const scanAndAttach = () => {
-      if (typeof document === 'undefined') return;
-      const list = document.querySelectorAll('audio');
-      list.forEach((el) => attachAudio(el));
-    };
-
-    scanAndAttach();
-
-    let obs = null;
-    if (typeof MutationObserver !== 'undefined' && typeof document !== 'undefined' && document.body) {
-      obs = new MutationObserver(() => scanAndAttach());
-      obs.observe(document.body, { childList: true, subtree: true });
-    }
-
-    let motionUnsub = null;
-    if (typeof window !== 'undefined' && window.__folia_current_time && typeof window.__folia_current_time.on === 'function') {
-      try {
-        motionUnsub = window.__folia_current_time.on('change', () => {
-          pushPlaybackAnchor(false);
-        });
-      } catch {}
-    }
-
-    return () => {
-      if (obs) obs.disconnect();
-      if (motionUnsub) {
-        try { motionUnsub(); } catch {}
-      }
-      attachedAudios.forEach((el) => {
-        try {
-          el.removeEventListener('timeupdate', onAudioEvent);
-          el.removeEventListener('seeking', onAudioEvent);
-          el.removeEventListener('seeked', onAudioEvent);
-          el.removeEventListener('play', onAudioEvent);
-          el.removeEventListener('pause', onAudioEvent);
-          el.removeEventListener('ratechange', onAudioEvent);
-        } catch {}
-      });
-      attachedAudios.clear();
-    };
-  }
-
-  const audioSyncDisposer = setupAudioTimeSync();
 
   // Listen for Folia Event Bus
   const unsubs = [];
@@ -1641,9 +1558,6 @@ export default function activate(folium) {
   // Return Disposer
   return () => {
     clearInterval(actionPollTimer);
-    if (audioSyncDisposer) {
-      try { audioSyncDisposer(); } catch {}
-    }
     unsubs.forEach((unsub) => {
       try { unsub(); } catch { /* ignore */ }
     });
