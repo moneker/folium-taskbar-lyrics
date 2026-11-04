@@ -55,6 +55,24 @@ html, body {
   display: flex;
   align-items: center;
   background: transparent;
+  opacity: 1;
+  transition: opacity 0.18s ease;
+}
+
+/* Hover-hide active state: fades out completely so user interacts with native taskbar underneath */
+.app-root.hover-hidden {
+  opacity: 0 !important;
+  pointer-events: none !important;
+  transition: opacity 0.14s ease;
+}
+
+/* In hover-hide mode, hide the left toggle button and use symmetric padding */
+.app-root.hover-hide-mode .toggle-button {
+  display: none;
+}
+
+.app-root.hover-hide-mode .drawer-panel {
+  padding-left: 18px;
 }
 
 /* ======================================================== */
@@ -171,8 +189,14 @@ html, body {
   z-index: 50;
 }
 
+/* Release compositor layers when fully collapsed */
+.app-root.collapsed .drawer-panel {
+  visibility: hidden;
+}
+
 /* Expanded state: entered from right, fully active */
 .app-root.expanded .drawer-panel {
+  visibility: visible;
   transform: translateX(0);
   opacity: 1;
   pointer-events: auto;
@@ -181,6 +205,7 @@ html, body {
 
 /* Exiting state: continues sliding to the LEFT out of the screen */
 .app-root.exiting .drawer-panel {
+  visibility: visible;
   transform: translateX(-100%);
   opacity: 0;
   pointer-events: none;
@@ -212,7 +237,6 @@ html, body {
   transform: scale(1.35);
   opacity: 0;
   transition: opacity 0.9s cubic-bezier(0.16, 1, 0.3, 1);
-  will-change: opacity;
 }
 
 .drawer-cover-bg.loaded {
@@ -403,7 +427,6 @@ html, body {
   opacity: 1;
   transform: translateY(0);
   transition: opacity 0.14s ease, transform 0.14s ease, filter 0.2s ease;
-  will-change: background, opacity, transform;
 }
 
 .lyrics-stage-section.single-row .lyric-main {

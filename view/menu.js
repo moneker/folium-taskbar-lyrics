@@ -1,6 +1,6 @@
 // mods/taskbar-lyrics/view/menu.js
 // Logic for taskbar lyrics floating menu: unified breadcrumbs navigation (书库 > 歌单 > 具体歌单 > 列表),
-// live play queue with pagination, loop mode switching, complete music library, and volume controls.
+// live play queue with pagination, loop mode switching, display switching, complete music library, and volume controls.
 
 (function () {
   'use strict';
@@ -23,6 +23,8 @@
   // DOM Elements - Footer Controls
   const loopModeBtn = document.getElementById('loopModeBtn');
   const shuffleBtn = document.getElementById('shuffleBtn');
+  const displaySwitchBtn = document.getElementById('displaySwitchBtn');
+  const displaySwitchLabel = document.getElementById('displaySwitchLabel');
   const loopIconAll = document.getElementById('loopIconAll');
   const loopIconOne = document.getElementById('loopIconOne');
   const loopIconOff = document.getElementById('loopIconOff');
@@ -535,7 +537,7 @@
       el.className = 'list-item';
       el.innerHTML = `
         <div class="list-item-cover">
-          ${pl.coverUrl ? `<img src="${escapeHtml(pl.coverUrl)}" alt="" />` : `
+          ${pl.coverUrl ? `<img src="${escapeHtml(pl.coverUrl)}" loading="lazy" alt="" />` : `
             <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round">
               <path d="M9 18V5l12-2v13"></path><circle cx="6" cy="18" r="3"></circle><circle cx="18" cy="16" r="3"></circle>
             </svg>
@@ -582,7 +584,7 @@
       el.className = 'list-item';
       el.innerHTML = `
         <div class="list-item-cover">
-          ${alb.coverUrl ? `<img src="${escapeHtml(alb.coverUrl)}" alt="" />` : `
+          ${alb.coverUrl ? `<img src="${escapeHtml(alb.coverUrl)}" loading="lazy" alt="" />` : `
             <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.2">
               <circle cx="12" cy="12" r="10"></circle><circle cx="12" cy="12" r="3"></circle>
             </svg>
@@ -796,7 +798,11 @@
       `;
 
       el.addEventListener('click', () => {
-        bridge.sendPlaybackAction('playLibrarySong', { song, queueContext: currentCategoryItems });
+        bridge.sendPlaybackAction('playLibrarySong', {
+          songId: song.id,
+          song,
+          contextType: 'local',
+        });
       });
 
       list.appendChild(el);
@@ -940,7 +946,12 @@
       `;
 
       el.addEventListener('click', () => {
-        bridge.sendPlaybackAction('playLibrarySong', { song, queueContext: filteredSongs });
+        bridge.sendPlaybackAction('playLibrarySong', {
+          songId: song.id,
+          song,
+          contextType: currentTop.subtype === 'daily_songs' ? 'daily' : 'detail',
+          filterQuery: songSearchQuery || '',
+        });
       });
 
       list.appendChild(el);
@@ -951,7 +962,7 @@
   }
 
   // =========================================================================
-  // Footer Controls: Mode, Shuffle, Volume
+  // Footer Controls: Mode, Shuffle, Display Switch, Volume
   // =========================================================================
 
   function updateLoopMode(mode) {
@@ -974,6 +985,25 @@
         if (loopModeLabel) loopModeLabel.textContent = '列表循环';
         break;
     }
+  }
+
+  function updateDisplayInfo(displayInfo) {
+    if (!displayInfo || !displaySwitchBtn) return;
+    const total = Number(displayInfo.totalDisplays) || 1;
+    const activeIndex = Number(displayInfo.activeIndex) || 0;
+    const isPrimary = Boolean(displayInfo.isPrimary);
+
+    if (displaySwitchLabel) {
+      if (total <= 1) {
+        displaySwitchLabel.textContent = '主屏';
+      } else {
+        displaySwitchLabel.textContent = isPrimary ? `主屏 (${activeIndex + 1}/${total})` : `副屏 ${activeIndex + 1}`;
+      }
+    }
+
+    displaySwitchBtn.title = total > 1
+      ? `当前显示于 ${displayInfo.activeLabel || '主屏'}，点击切换到下一块屏幕`
+      : '当前仅检测到 1 台显示器（可在模组设置中选择跟随壁纸显示器）';
   }
 
   function updateVolume(vol, isMuted) {
@@ -1004,6 +1034,12 @@
   if (shuffleBtn) {
     shuffleBtn.addEventListener('click', () => {
       bridge.sendPlaybackAction('shuffleQueue');
+    });
+  }
+
+  if (displaySwitchBtn && typeof bridge.switchDisplay === 'function') {
+    displaySwitchBtn.addEventListener('click', () => {
+      bridge.switchDisplay();
     });
   }
 
@@ -1048,6 +1084,24 @@
   }
 
   // =========================================================================
+  // Memory Release on Menu Close
+  // =========================================================================
+
+  if (typeof bridge.onMenuClosed === 'function') {
+    bridge.onMenuClosed(() => {
+      currentDetailSongs = [];
+      currentCategoryItems = [];
+      currentRadioFeed = null;
+      songSearchQuery = '';
+      if (navStack.length !== 1 || navStack[0]?.type !== 'queue') {
+        navStack.length = 0;
+        navStack.push({ type: 'queue', title: '播放队列' });
+        renderCurrentView();
+      }
+    });
+  }
+
+  // =========================================================================
   // Snapshot Reception from Main Process
   // =========================================================================
 
@@ -1059,7 +1113,12 @@
       applyTheme(data.theme);
     }
 
-    // 2. Queue & Pagination
+    // 2. Display Info
+    if (data.displayInfo) {
+      updateDisplayInfo(data.displayInfo);
+    }
+
+    // 3. Queue & Pagination
     if (Array.isArray(data.queue)) {
       queueState.items = data.queue;
       if (typeof data.queueTotal === 'number') queueState.total = data.queueTotal;
@@ -1074,7 +1133,7 @@
       }
     }
 
-    // 3. Library Summary Data
+    // 4. Library Summary Data
     if (data.librarySummary) {
       librarySummary = { ...librarySummary, ...data.librarySummary };
       if (navStack.length === 0) {
@@ -1082,7 +1141,7 @@
       }
     }
 
-    // 4. Library Category Data
+    // 5. Library Category Data
     if (data.libraryCategoryData) {
       if (data.libraryCategoryData.radioFeed) {
         currentRadioFeed = data.libraryCategoryData.radioFeed;
@@ -1103,7 +1162,7 @@
       }
     }
 
-    // 5. Library Detail Data (Songs inside a playlist or album)
+    // 6. Library Detail Data (Songs inside a playlist or album)
     if (data.libraryDetailData) {
       currentDetailSongs = data.libraryDetailData.songs || [];
       if (navStack.length > 0 && navStack[navStack.length - 1].type === 'detail') {
@@ -1111,13 +1170,13 @@
       }
     }
 
-    // 6. Loop Mode
+    // 7. Loop Mode
     if (typeof data.loopMode === 'string') {
       footerState.loopMode = data.loopMode;
       updateLoopMode(footerState.loopMode);
     }
 
-    // 7. Volume
+    // 8. Volume
     if (data.volume !== undefined || data.isMuted !== undefined) {
       if (typeof data.volume === 'number' && Number.isFinite(data.volume)) {
         footerState.volume = data.volume;

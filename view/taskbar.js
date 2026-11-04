@@ -1,6 +1,6 @@
 // mods/taskbar-lyrics/view/taskbar.js
-// Client logic for taskbar lyrics drawer: clock interpolation, fluid karaoke wipe,
-// robust cover rendering, and unidirectional right-to-left slide animation.
+// Client logic for taskbar lyrics drawer: monotonic clock interpolation, fluid karaoke wipe,
+// hover-hide coordination, cover rendering, and low-overhead render loop.
 
 (function () {
   'use strict';
@@ -20,6 +20,7 @@
   const coverFallback = document.getElementById('coverFallback');
   const songTitle = document.getElementById('songTitle');
   const songArtist = document.getElementById('songArtist');
+  const lyricsStage = document.querySelector('.lyrics-stage-section');
   const lyricMain = document.getElementById('lyricMain');
   const lyricSub = document.getElementById('lyricSub');
   const timeCurrent = document.getElementById('timeCurrent');
@@ -32,12 +33,12 @@
   const nextBtn = document.getElementById('nextBtn');
   const playIcon = document.getElementById('playIcon');
   const pauseIcon = document.getElementById('pauseIcon');
-
   const menuBtn = document.getElementById('menuBtn');
 
-  // State
+  // Drawer & Hover State
   let isExpanded = false;
   let isAnimating = false;
+  let isHoverHidden = false;
   let animationSafetyTimer = null;
 
   function setAnimating(val) {
@@ -49,24 +50,57 @@
     if (val) {
       animationSafetyTimer = setTimeout(() => {
         isAnimating = false;
+        syncRenderLoop();
       }, 420);
     }
+    syncRenderLoop();
   }
 
   let snapshot = {
     song: null,
     playerState: 'paused',
+    isAdvancing: false,
     currentTime: 0,
     duration: 0,
     updatedAt: Date.now(),
     lyrics: null,
     lyricOffsetMs: 0,
-    settings: { showTranslation: true },
+    settings: {
+      interactionMode: 'standard',
+      targetDisplay: 'primary',
+      showTranslation: true,
+      useCoverBackground: true,
+    },
   };
 
+  // Monotonic clock & deduplication state
+  let lastRenderedAudioTime = 0;
+  let clockRate = 1.0;
   let activeLineIndex = -999;
   let currentActiveLine = null;
+  let lastWipeLineIndex = -999;
+  let lastWipePct = 0;
+  let lastWipeCssStr = '';
+  let lastDisplayedSecond = -1;
+  let lastProgressPctStr = '';
   let animationFrameId = null;
+
+  function resetMonotonicTrackers(newTime = 0) {
+    lastRenderedAudioTime = Math.max(0, newTime);
+    clockRate = 1.0;
+    activeLineIndex = -999;
+    currentActiveLine = null;
+    lastWipeLineIndex = -999;
+    lastWipePct = 0;
+  }
+
+  function setWipeCssProperty(pctValue) {
+    const str = `${pctValue.toFixed(1)}%`;
+    if (str !== lastWipeCssStr) {
+      lastWipeCssStr = str;
+      lyricMain.style.setProperty('--wipe-pct', str);
+    }
+  }
 
   // Format seconds to mm:ss
   function formatTime(seconds) {
@@ -76,15 +110,25 @@
     return `${m}:${s < 10 ? '0' : ''}${s}`;
   }
 
-  // Get raw audio playback time (for elapsed clock & seek bar)
+  // Get monotonic audio playback time (only extrapolates when actual audio hardware is advancing)
   function getRawAudioTime() {
     let t = snapshot.currentTime || 0;
-    if (snapshot.playerState === 'playing' && snapshot.updatedAt) {
-      const elapsed = Math.max(0, (Date.now() - snapshot.updatedAt) / 1000);
+    const advancing = snapshot.playerState === 'playing' && snapshot.isAdvancing !== false;
+    if (advancing && snapshot.updatedAt) {
+      const elapsed = Math.max(0, (Date.now() - snapshot.updatedAt) / 1000) * clockRate;
       t += elapsed;
       if (snapshot.duration > 0 && t > snapshot.duration) {
         t = snapshot.duration;
       }
+    }
+    if (advancing) {
+      if (t < lastRenderedAudioTime && (lastRenderedAudioTime - t) < 1.5) {
+        t = lastRenderedAudioTime;
+      } else {
+        lastRenderedAudioTime = t;
+      }
+    } else {
+      lastRenderedAudioTime = t;
     }
     return Math.max(0, t);
   }
@@ -182,11 +226,13 @@
       // Enter from right to left (100% -> 0)
       appRoot.classList.remove('collapsed', 'exiting');
       appRoot.classList.add('expanded');
+      renderSingleFrame();
     } else {
       // Exit continuing to left (0 -> -100%)
       appRoot.classList.remove('expanded');
       appRoot.classList.add('exiting');
     }
+    syncRenderLoop();
   }
 
   // Drawer transitionend handler
@@ -206,6 +252,7 @@
       } else if (appRoot.classList.contains('expanded')) {
         bridge.notifyAnimationComplete('expanded');
       }
+      syncRenderLoop();
     }
   });
 
@@ -223,13 +270,41 @@
     bridge.toggleDrawer();
   }
 
-  // Assert topmost on any pointer interaction with the taskbar lyrics window
+  // Hover-hide & Topmost pointer handlers
+  function handlePointerEnterOrMove() {
+    if (snapshot.settings?.interactionMode === 'hover-hide') {
+      if (!isHoverHidden && typeof bridge.notifyHoverEnter === 'function') {
+        bridge.notifyHoverEnter();
+      }
+      return;
+    }
+    bridge.assertTop();
+  }
+
   appRoot.addEventListener('pointerdown', () => {
+    if (snapshot.settings?.interactionMode === 'hover-hide') {
+      if (typeof bridge.notifyHoverEnter === 'function') bridge.notifyHoverEnter();
+      return;
+    }
     bridge.assertTop();
   });
-  appRoot.addEventListener('pointerenter', () => {
-    bridge.assertTop();
+  appRoot.addEventListener('pointerenter', handlePointerEnterOrMove);
+  appRoot.addEventListener('mousemove', () => {
+    if (snapshot.settings?.interactionMode === 'hover-hide' && !isHoverHidden) {
+      if (typeof bridge.notifyHoverEnter === 'function') bridge.notifyHoverEnter();
+    }
   });
+
+  if (typeof bridge.onHoverHidden === 'function') {
+    bridge.onHoverHidden((hidden) => {
+      isHoverHidden = Boolean(hidden);
+      appRoot.classList.toggle('hover-hidden', isHoverHidden);
+      if (!isHoverHidden) {
+        renderSingleFrame();
+      }
+      syncRenderLoop();
+    });
+  }
 
   toggleBtn.addEventListener('click', handleToggleTrigger);
 
@@ -254,10 +329,19 @@
     if (!snapshot.duration || snapshot.duration <= 0) return 0;
     const clampedRatio = Math.max(0, Math.min(1, ratio));
     const targetTime = clampedRatio * snapshot.duration;
-    const pct = clampedRatio * 100;
+    const pct = (clampedRatio * 100).toFixed(1);
     progressFill.style.width = `${pct}%`;
     progressThumb.style.left = `${pct}%`;
-    timeCurrent.textContent = formatTime(targetTime);
+    lastProgressPctStr = pct;
+    const sec = Math.floor(targetTime);
+    if (sec !== lastDisplayedSecond) {
+      lastDisplayedSecond = sec;
+      timeCurrent.textContent = formatTime(targetTime);
+    }
+    if (isDraggingProgress) {
+      const effectivePreviewTime = Math.max(0, targetTime - (snapshot.lyricOffsetMs || 0) / 1000);
+      updateLyrics(effectivePreviewTime, true);
+    }
     return targetTime;
   }
 
@@ -290,18 +374,20 @@
     const ratio = getRatioFromEvent(e);
     const targetTime = updateSeekDisplay(ratio);
 
-    // Apply immediate local state update
+    // Apply immediate local state update and hold clock extrapolation until audio decoder settles
+    const now = Date.now();
     snapshot.currentTime = targetTime;
-    snapshot.updatedAt = Date.now();
-    seekCooldownUntil = Date.now() + 600;
+    snapshot.updatedAt = now;
+    snapshot.isAdvancing = false;
+    seekCooldownUntil = now + 900;
+    resetMonotonicTrackers(targetTime);
 
     // Send action to Folia engine
     bridge.sendPlaybackAction('seek', targetTime);
 
     // Immediately sync lyrics to seek position
-    activeLineIndex = -999;
-    currentActiveLine = null;
-    updateLyrics(getEffectiveLyricTime());
+    updateLyrics(getEffectiveLyricTime(), true);
+    syncRenderLoop();
   };
 
   progressBar.addEventListener('pointerup', finishSeek);
@@ -397,42 +483,11 @@
     };
   }
 
-  /**
-   * Applies the synchronized Folia theme (Daylight vs Dark, accent colors, and custom fonts).
-   */
-  function applyTheme(theme) {
-    if (!theme) return;
-    const isDaylight = Boolean(theme.isDaylight);
-    if (isDaylight) {
-      document.documentElement.classList.add('daylight');
-      document.body.classList.add('daylight');
-      appRoot.classList.add('daylight');
-    } else {
-      document.documentElement.classList.remove('daylight');
-      document.body.classList.remove('daylight');
-      appRoot.classList.remove('daylight');
-    }
-
-    const rootStyle = document.documentElement.style;
-    if (theme.accentColor) {
-      rootStyle.setProperty('--accent-color', theme.accentColor);
-      rootStyle.setProperty('--accent-glow', `${theme.accentColor}55`);
-      rootStyle.setProperty('--accent-gradient', `linear-gradient(135deg, ${theme.accentColor}, ${theme.accentColor}cc)`);
-    }
-    if (theme.primaryColor) {
-      rootStyle.setProperty('--text-primary', theme.primaryColor);
-    }
-    if (theme.secondaryColor) {
-      rootStyle.setProperty('--text-secondary', theme.secondaryColor);
-    }
-    if (theme.fontFamily) {
-      rootStyle.setProperty('--app-font-family', theme.fontFamily);
-    }
-  }
-
   // Receive Snapshot from Main Process
   let lastSongTitle = '';
   let lastSongArtist = '';
+  let lastCoverBgSrc = '';
+
   bridge.onSnapshot((data) => {
     if (!data) return;
 
@@ -440,19 +495,20 @@
       applyTheme(data.theme);
     }
 
-    const currentTitle = data.song?.title || '';
-    const currentArtist = data.song?.artist || '';
+    const currentTitle = data.song !== undefined ? (data.song?.title || '') : lastSongTitle;
+    const currentArtist = data.song !== undefined ? (data.song?.artist || '') : lastSongArtist;
     const isSongChanged = Boolean(data.song && (currentTitle !== lastSongTitle || currentArtist !== lastSongArtist));
     const isLyricsLoaded = Boolean(data.lyrics !== undefined && data.lyrics !== snapshot.lyrics);
 
     if (isSongChanged) {
       lastSongTitle = currentTitle;
       lastSongArtist = currentArtist;
-      activeLineIndex = -999;
-      currentActiveLine = null;
+      resetMonotonicTrackers(typeof data.currentTime === 'number' ? data.currentTime : 0);
     } else if (isLyricsLoaded) {
       activeLineIndex = -999;
       currentActiveLine = null;
+      lastWipeLineIndex = -999;
+      lastWipePct = 0;
     }
 
     let nextLyrics = snapshot.lyrics;
@@ -475,36 +531,108 @@
       }
       activeLineIndex = -999;
       currentActiveLine = null;
+      lastWipeLineIndex = -999;
+      lastWipePct = 0;
     }
 
-    // Guard seek cooldown against stale position echo from audio decoder during seek
-    if (seekCooldownUntil > Date.now() && typeof data.currentTime === 'number') {
-      if (Math.abs(data.currentTime - snapshot.currentTime) > 1.5) {
-        delete data.currentTime;
-        delete data.updatedAt;
+    const now = Date.now();
+    const nextState = data.playerState !== undefined ? data.playerState : snapshot.playerState;
+    let nextAdvancing = data.isAdvancing !== undefined ? Boolean(data.isAdvancing) : snapshot.isAdvancing;
+    if (nextState !== 'playing') {
+      nextAdvancing = false;
+    }
+    if (isSongChanged && data.isAdvancing === undefined) {
+      nextAdvancing = false;
+    }
+
+    let nextCurrentTime = snapshot.currentTime;
+    let nextUpdatedAt = snapshot.updatedAt;
+    let isDiscontinuous = isSongChanged || Boolean(data.isSeek);
+
+    if (isDraggingProgress && !isSongChanged) {
+      // Do not overwrite user drag preview with incoming background ticks
+    } else if (typeof data.currentTime === 'number' && Number.isFinite(data.currentTime)) {
+      // Guard seek cooldown against stale position echo from audio decoder right after user drags slider
+      const inSeekCooldown = seekCooldownUntil > now && !data.isSeek && !isSongChanged;
+      if (inSeekCooldown && Math.abs(data.currentTime - snapshot.currentTime) > 1.2) {
+        // Ignore stale pre-seek echo and keep holding clock until decoder catches up
+        nextAdvancing = false;
       } else {
-        seekCooldownUntil = 0;
+        if (inSeekCooldown && nextAdvancing) {
+          seekCooldownUntil = 0;
+        }
+        const incomingStamp = data.updatedAt || now;
+        const incomingElapsed = (nextState === 'playing' && nextAdvancing)
+          ? Math.max(0, (now - incomingStamp) / 1000)
+          : 0;
+        const incomingLiveTime = data.currentTime + incomingElapsed;
+        const timeDelta = incomingLiveTime - lastRenderedAudioTime;
+
+        if (isDiscontinuous || Math.abs(timeDelta) >= 1.5) {
+          // Intentional seek, song change, or large correction (>1.5s)
+          nextCurrentTime = data.currentTime;
+          nextUpdatedAt = incomingStamp;
+          resetMonotonicTrackers(incomingLiveTime);
+          isDiscontinuous = true;
+        } else if (nextState !== 'playing' || !nextAdvancing) {
+          // Paused or audio is loading/buffering/seeking: hold clock without resetting activeLineIndex
+          nextCurrentTime = timeDelta >= 0 ? data.currentTime : lastRenderedAudioTime;
+          nextUpdatedAt = now;
+          lastRenderedAudioTime = nextCurrentTime;
+          clockRate = 1.0;
+        } else if (timeDelta >= 0) {
+          // Incoming clock is ahead or aligned: advance smoothly at 1.0x
+          nextCurrentTime = data.currentTime;
+          nextUpdatedAt = incomingStamp;
+          lastRenderedAudioTime = incomingLiveTime;
+          clockRate = 1.0;
+        } else {
+          // Incoming snapshot is slightly behind local extrapolation (-1.5s < timeDelta < 0) due to
+          // background timer throttling, memory pressure, or IPC delay.
+          // Pin to lastRenderedAudioTime so the lyric wipe and line never bounce backward, and
+          // gently slow clockRate until the real audio clock catches up.
+          nextCurrentTime = lastRenderedAudioTime;
+          nextUpdatedAt = now;
+          clockRate = timeDelta < -0.2 ? 0.65 : (timeDelta < -0.05 ? 0.85 : 1.0);
+        }
       }
+    } else if (
+      (data.playerState !== undefined && data.playerState !== snapshot.playerState) ||
+      (data.isAdvancing !== undefined && Boolean(data.isAdvancing) !== snapshot.isAdvancing)
+    ) {
+      // State or advancing flag changed without explicit currentTime: freeze or resume from current position
+      nextCurrentTime = lastRenderedAudioTime;
+      nextUpdatedAt = now;
+      clockRate = 1.0;
     }
 
-    snapshot = {
-      ...snapshot,
-      ...data,
-      lyrics: nextLyrics,
-      settings: {
+    if (data.song !== undefined) snapshot.song = data.song;
+    if (data.playerState !== undefined) snapshot.playerState = nextState;
+    snapshot.isAdvancing = nextAdvancing;
+    if (data.duration !== undefined) snapshot.duration = data.duration;
+    if (data.lyricOffsetMs !== undefined) snapshot.lyricOffsetMs = data.lyricOffsetMs;
+    snapshot.currentTime = nextCurrentTime;
+    snapshot.updatedAt = nextUpdatedAt;
+    snapshot.lyrics = nextLyrics;
+
+    if (data.settings) {
+      snapshot.settings = {
         ...snapshot.settings,
-        ...(data.settings || {}),
-      },
-      updatedAt: data.updatedAt || Date.now(),
-    };
-
-    if (data.theme) {
-      applyTheme(data.theme);
+        ...data.settings,
+      };
+      const isHoverMode = snapshot.settings.interactionMode === 'hover-hide';
+      appRoot.classList.toggle('hover-hide-mode', isHoverMode);
     }
 
-    updateMetadata();
-    updatePlayerState();
-    updateLyrics(getEffectiveLyricTime());
+    if (data.song !== undefined || data.duration !== undefined || data.lyrics !== undefined || data.settings !== undefined) {
+      updateMetadata();
+    }
+    if (data.playerState !== undefined) {
+      updatePlayerState();
+    }
+
+    renderSingleFrame(isDiscontinuous);
+    syncRenderLoop();
   });
 
   // Update Metadata (Song Title, Artist, Cover)
@@ -514,18 +642,19 @@
       songTitle.textContent = song.title || '未知曲目';
       songArtist.textContent = song.artist || 'Folia';
       if (song.coverUrl) {
-        if (coverImg.src !== song.coverUrl) {
+        if (coverImg.getAttribute('data-src') !== song.coverUrl) {
+          coverImg.setAttribute('data-src', song.coverUrl);
           coverImg.src = song.coverUrl;
         }
       } else {
+        coverImg.removeAttribute('data-src');
         coverImg.src = '';
         coverImg.style.opacity = '0';
         if (coverFallback) coverFallback.style.display = 'flex';
       }
 
-      // If lyrics are not present yet, immediately display song info in center stage to eliminate stuck placeholder
+      // If lyrics are not present yet, immediately display song info in center stage
       if (!snapshot.lyrics || !Array.isArray(snapshot.lyrics.lines) || snapshot.lyrics.lines.length === 0) {
-        const lyricsStage = document.querySelector('.lyrics-stage-section');
         if (song.title) {
           lyricMain.textContent = song.title;
           lyricSub.textContent = song.artist || '';
@@ -538,39 +667,40 @@
           lyricSub.textContent = '';
           if (lyricsStage) lyricsStage.classList.add('single-row');
         }
-        lyricMain.style.setProperty('--wipe-pct', '100%');
+        setWipeCssProperty(100);
       }
     } else {
       songTitle.textContent = '等待播放';
       songArtist.textContent = 'Folia';
+      coverImg.removeAttribute('data-src');
       coverImg.src = '';
       coverImg.style.opacity = '0';
       if (coverFallback) coverFallback.style.display = 'flex';
       lyricMain.textContent = '♪ 享受纯净旋律 ♪';
-      lyricMain.style.setProperty('--wipe-pct', '100%');
+      setWipeCssProperty(100);
       lyricSub.textContent = '';
     }
 
-    // Folia-style blurred fluid cover background
+    // Folia-style blurred fluid cover background (load directly into drawerCoverBg without extra Image instance)
     if (drawerCoverBg) {
       const useCoverBg = snapshot.settings?.useCoverBackground !== false;
-      const targetCoverUrl = song && song.coverUrl ? song.coverUrl : '';
-      if (useCoverBg && targetCoverUrl) {
-        if (drawerCoverBg.getAttribute('data-src') !== targetCoverUrl) {
-          drawerCoverBg.setAttribute('data-src', targetCoverUrl);
-          const bgLoader = new Image();
-          bgLoader.onload = () => {
-            drawerCoverBg.src = targetCoverUrl;
+      const targetCoverUrl = useCoverBg && song && song.coverUrl ? song.coverUrl : '';
+      if (targetCoverUrl) {
+        if (lastCoverBgSrc !== targetCoverUrl) {
+          lastCoverBgSrc = targetCoverUrl;
+          drawerCoverBg.onload = () => {
             drawerCoverBg.classList.add('loaded');
           };
-          bgLoader.onerror = () => {
+          drawerCoverBg.onerror = () => {
             drawerCoverBg.classList.remove('loaded');
           };
-          bgLoader.src = targetCoverUrl;
+          drawerCoverBg.src = targetCoverUrl;
         }
-      } else {
+      } else if (lastCoverBgSrc !== '') {
+        lastCoverBgSrc = '';
+        drawerCoverBg.onload = null;
+        drawerCoverBg.onerror = null;
         drawerCoverBg.classList.remove('loaded');
-        drawerCoverBg.removeAttribute('data-src');
         drawerCoverBg.src = '';
       }
     }
@@ -646,37 +776,47 @@
   }
 
   // Update Karaoke Lyric Line
-  function updateLyrics(time) {
+  function updateLyrics(time, allowBackward = false) {
     const lyrics = snapshot.lyrics;
     if (!lyrics || !Array.isArray(lyrics.lines) || lyrics.lines.length === 0) {
       if (activeLineIndex !== -1) {
         activeLineIndex = -1;
         currentActiveLine = null;
+        lastWipeLineIndex = -1;
+        lastWipePct = 0;
         lyricMain.textContent = snapshot.song?.title
           ? `${snapshot.song.title} - ${snapshot.song.artist || 'Folia'}`
           : '♪ 享受纯净旋律 ♪';
-        lyricMain.style.setProperty('--wipe-pct', '0%');
+        setWipeCssProperty(0);
         lyricSub.textContent = '';
       }
       return;
     }
 
     const lines = lyrics.lines;
-    const { index: currentIdx, line: matchLine, isInterlude } = findLatestActiveLine(lines, time);
+    let { index: currentIdx, line: matchLine, isInterlude } = findLatestActiveLine(lines, time);
+
+    // Prevent accidental 1-line backward bounce during normal continuous playback
+    if (!allowBackward && snapshot.playerState === 'playing' && activeLineIndex >= 0 && currentIdx >= 0 && currentIdx < activeLineIndex) {
+      currentIdx = activeLineIndex;
+      matchLine = currentActiveLine;
+      isInterlude = false;
+    }
 
     if (currentIdx !== activeLineIndex) {
       activeLineIndex = currentIdx;
       currentActiveLine = matchLine;
+      lastWipeLineIndex = currentIdx;
+      lastWipePct = 0;
       renderActiveLine(currentActiveLine, isInterlude);
     }
 
     // High frequency continuous fluid wipe progress
-    updateContinuousLyricWipe(currentActiveLine, time);
+    updateContinuousLyricWipe(currentActiveLine, time, allowBackward);
   }
 
   // Render text for active line with clear hierarchy and micro-transition
   function renderActiveLine(line, isInterlude) {
-    const lyricsStage = document.querySelector('.lyrics-stage-section');
     if (!line) {
       if (lyricsStage) lyricsStage.classList.add('single-row');
       const song = snapshot.song;
@@ -687,7 +827,7 @@
       } else {
         lyricMain.textContent = '♪ 享受纯净旋律 ♪';
       }
-      lyricMain.style.setProperty('--wipe-pct', '0%');
+      setWipeCssProperty(0);
       lyricSub.textContent = '';
       return;
     }
@@ -706,7 +846,7 @@
     // Micro-dissolve transition on line advance
     lyricMain.classList.add('line-switching');
     lyricMain.textContent = line.fullText || line.text || '';
-    lyricMain.style.setProperty('--wipe-pct', '0%');
+    setWipeCssProperty(0);
     requestAnimationFrame(() => {
       requestAnimationFrame(() => {
         lyricMain.classList.remove('line-switching');
@@ -716,29 +856,26 @@
 
   /**
    * Calculates continuous sub-character progress for professional karaoke gradient sweep.
+   * Enforces monotonic forward progress within the same active line unless seeking.
    * @param {object|null} line Active lyric line
    * @param {number} time Current playback timestamp in seconds
+   * @param {boolean} allowBackward True when user just seeked
    */
-  function updateContinuousLyricWipe(line, time) {
+  function updateContinuousLyricWipe(line, time, allowBackward = false) {
     if (!line) {
-      lyricMain.style.setProperty('--wipe-pct', '0%');
+      setWipeCssProperty(0);
       return;
     }
 
     const start = Number(line.startTime) || 0;
     const end = Math.max(start + 0.1, Number(line.endTime) || (start + 4));
 
+    let pct = 0;
     if (time <= start) {
-      lyricMain.style.setProperty('--wipe-pct', '0%');
-      return;
-    }
-    if (time >= end) {
-      lyricMain.style.setProperty('--wipe-pct', '100%');
-      return;
-    }
-
-    // If word-by-word timestamps are available
-    if (Array.isArray(line.words) && line.words.length > 0) {
+      pct = 0;
+    } else if (time >= end) {
+      pct = 100;
+    } else if (Array.isArray(line.words) && line.words.length > 0) {
       const fullTextLen = (line.fullText || line.text || '').length;
       const wordCharsSum = line.words.reduce((sum, w) => sum + (w.text ? w.text.length : 1), 0) || 1;
       const totalChars = Math.max(fullTextLen, wordCharsSum);
@@ -761,46 +898,70 @@
         }
       }
 
-      const pct = Math.max(0, Math.min(100, (charsPassed / totalChars) * 100));
-      lyricMain.style.setProperty('--wipe-pct', `${pct.toFixed(2)}%`);
+      pct = Math.max(0, Math.min(100, (charsPassed / totalChars) * 100));
     } else {
       // Line-level fluid progress
       const fraction = Math.max(0, Math.min(1, (time - start) / (end - start)));
-      const pct = fraction * 100;
-      lyricMain.style.setProperty('--wipe-pct', `${pct.toFixed(2)}%`);
+      pct = fraction * 100;
     }
+
+    if (!allowBackward && activeLineIndex === lastWipeLineIndex) {
+      pct = Math.max(lastWipePct, pct);
+    }
+    lastWipeLineIndex = activeLineIndex;
+    lastWipePct = pct;
+
+    setWipeCssProperty(pct);
   }
 
-  // Main high-frequency render loop
-  function tick() {
-    if (!isDraggingProgress) {
-      const audioTime = getRawAudioTime();
+  function renderSingleFrame(allowBackward = false) {
+    if (isDraggingProgress) {
+      return;
+    }
+    const audioTime = getRawAudioTime();
+    const sec = Math.floor(audioTime);
+    if (sec !== lastDisplayedSecond) {
+      lastDisplayedSecond = sec;
       timeCurrent.textContent = formatTime(audioTime);
-
-      // Progress bar fill
-      if (snapshot.duration > 0) {
-        const pct = Math.min(100, Math.max(0, (audioTime / snapshot.duration) * 100));
-        progressFill.style.width = `${pct}%`;
-        progressThumb.style.left = `${pct}%`;
-      } else {
-        progressFill.style.width = '0%';
-        progressThumb.style.left = '0%';
-      }
     }
 
-    // Lyrics update driven by effective lyric timeline
-    const lyricTime = getEffectiveLyricTime();
-    updateLyrics(lyricTime);
+    // Progress bar fill (deduplicated)
+    if (snapshot.duration > 0) {
+      const pct = Math.min(100, Math.max(0, (audioTime / snapshot.duration) * 100)).toFixed(1);
+      if (pct !== lastProgressPctStr) {
+        lastProgressPctStr = pct;
+        progressFill.style.width = `${pct}%`;
+        progressThumb.style.left = `${pct}%`;
+      }
+    } else if (lastProgressPctStr !== '0.0') {
+      lastProgressPctStr = '0.0';
+      progressFill.style.width = '0%';
+      progressThumb.style.left = '0%';
+    }
 
+    const lyricTime = getEffectiveLyricTime();
+    updateLyrics(lyricTime, allowBackward);
+  }
+
+  function shouldRunRenderLoop() {
+    return snapshot.playerState === 'playing' && snapshot.isAdvancing !== false && (isExpanded || isAnimating) && !isHoverHidden;
+  }
+
+  function tick() {
+    animationFrameId = null;
+    if (!shouldRunRenderLoop()) return;
+    renderSingleFrame(false);
     animationFrameId = requestAnimationFrame(tick);
   }
 
-  // Start tick loop
-  animationFrameId = requestAnimationFrame(tick);
-
-  window.addEventListener('beforeunload', () => {
-    if (animationFrameId) {
+  function syncRenderLoop() {
+    if (shouldRunRenderLoop()) {
+      if (!animationFrameId) {
+        animationFrameId = requestAnimationFrame(tick);
+      }
+    } else if (animationFrameId) {
       cancelAnimationFrame(animationFrameId);
+      animationFrameId = null;
     }
-  });
+  }
 })();
