@@ -99,19 +99,13 @@ export default function activate(folium) {
    */
   function resolveCurrentTheme() {
     try {
-      let isDaylight = false;
-      const tStore = folium.internals?.stores?.themeSettings;
-      if (tStore?.getState) {
-        isDaylight = Boolean(tStore.getState().isDaylight);
-      } else if (typeof localStorage !== 'undefined') {
-        isDaylight = localStorage.getItem('default_theme_daylight') === 'true';
+      if (cachedLiveTheme) {
+        return cachedLiveTheme;
       }
 
-      if (cachedLiveTheme) {
-        return {
-          ...cachedLiveTheme,
-          isDaylight,
-        };
+      let isDaylight = false;
+      if (typeof localStorage !== 'undefined') {
+        isDaylight = localStorage.getItem('default_theme_daylight') === 'true';
       }
 
       let customDualTheme = null;
@@ -177,10 +171,7 @@ export default function activate(folium) {
   async function initThemeFromStorage() {
     try {
       let isDaylight = false;
-      const tStore = folium.internals?.stores?.themeSettings;
-      if (tStore?.getState) {
-        isDaylight = Boolean(tStore.getState().isDaylight);
-      } else if (typeof localStorage !== 'undefined') {
+      if (typeof localStorage !== 'undefined') {
         isDaylight = localStorage.getItem('default_theme_daylight') === 'true';
       }
 
@@ -266,29 +257,22 @@ export default function activate(folium) {
    */
   function syncPlaybackStoreLyricsAndSong(resetIfEmpty = false) {
     try {
-      const pState = folium.internals?.stores?.playback?.getState?.();
-      if (!pState) return;
+      const hostState = folium.playback.getState();
+      if (hostState?.song) {
+        let coverUrl = null;
+        try {
+          const details = folium.omni?.describeSong?.(hostState.song);
+          coverUrl = details?.coverUrl || null;
+        } catch {}
 
-      const currentRawSong = pState.transitionDisplay?.song || pState.currentSong;
-      if (currentRawSong) {
-        const title = currentRawSong.name || currentRawSong.title || '未知曲目';
-        const artist = Array.isArray(currentRawSong.artists)
-          ? currentRawSong.artists.map((a) => a.name).filter(Boolean).join(' / ')
-          : (currentRawSong.artist || 'Folia');
-        const coverUrl = pState.transitionDisplay?.coverUrl
-          || pState.cachedCoverUrl
-          || currentRawSong.album?.coverUrl
-          || currentRawSong.coverUrl
-          || currentRawSong.picUrl
-          || null;
-
-        currentSnapshot.song = { title, artist, coverUrl };
+        currentSnapshot.song = {
+          title: hostState.song.title || '未知曲目',
+          artist: hostState.song.artist || 'Folia',
+          coverUrl,
+        };
       }
 
-      const rawLyrics = pState.transitionDisplay?.lyrics || pState.lyrics;
-      if (rawLyrics && Array.isArray(rawLyrics.lines) && rawLyrics.lines.length > 0) {
-        currentSnapshot.lyrics = formatLyricsLines(rawLyrics.lines);
-      } else if (resetIfEmpty) {
+      if (resetIfEmpty && !currentSnapshot.lyrics) {
         currentSnapshot.lyrics = null;
       }
     } catch {
@@ -314,12 +298,8 @@ export default function activate(folium) {
    */
   function isPlaybackStoreActive() {
     try {
-      const pState = folium.internals?.stores?.playback?.getState?.();
-      if (pState) {
-        if (pState.isLoadingToPlay || pState.isBuffering) return false;
-        return Boolean(pState.transitionDisplay) || String(pState.playerState).toUpperCase() === 'PLAYING' || pState.playerState === 1;
-      }
-      return true;
+      const hostState = folium.playback.getState();
+      return hostState?.state === 'playing';
     } catch {
       return true;
     }
@@ -572,11 +552,18 @@ export default function activate(folium) {
   }
 
   /**
+   * Resolves Omni service preferring official folium.omni over legacy internals.
+   */
+  function getOmni() {
+    return folium.omni || folium.internals?.omni || null;
+  }
+
+  /**
    * Retrieves all playlists combining active Omni online collections and local playlists.
    * Stores raw objects in cachedCollectionMap and returns lightweight DTOs for IPC.
    */
   async function getLibraryPlaylists() {
-    const omni = folium.internals?.omni;
+    const omni = getOmni();
     const list = [];
     const seenKeys = new Set();
 
@@ -706,7 +693,7 @@ export default function activate(folium) {
    * Retrieves all albums combining Omni online saved albums and local albums.
    */
   async function getLibraryAlbums() {
-    const omni = folium.internals?.omni;
+    const omni = getOmni();
     const list = [];
     const seenKeys = new Set();
 
@@ -851,7 +838,7 @@ export default function activate(folium) {
    * Retrieves Radio feed: Personal FM, Daily Recommendations, and Recommended Collections.
    */
   async function getLibraryRadioFeed() {
-    const omni = folium.internals?.omni;
+    const omni = getOmni();
     let homeFeed = null;
     if (omni?.getHomeFeed) {
       try {
@@ -906,7 +893,7 @@ export default function activate(folium) {
    * storing rawSong objects in cachedDetailRawSongs and returning lightweight DTOs.
    */
   async function getLibraryPlaylistSongs(playlistItem, reqId) {
-    const omni = folium.internals?.omni;
+    const omni = getOmni();
     const cachedEntry = playlistItem.cacheKey ? cachedCollectionMap.get(playlistItem.cacheKey) : null;
 
     // 1. Local playlist
@@ -1174,7 +1161,7 @@ export default function activate(folium) {
    */
   async function playPersonalFmMode() {
     try {
-      const omni = folium.internals?.omni;
+      const omni = getOmni();
       const pStore = folium.internals?.stores?.playback;
       if (!omni || !pStore) return;
 
@@ -1373,9 +1360,12 @@ export default function activate(folium) {
 
   function resolveEffectiveLyricOffsetMs() {
     try {
-      const songOffset = folium.internals?.stores?.playback?.getState?.()?.lyricTimelineOffsetMs || 0;
-      const globalOffset = folium.internals?.stores?.lyricSettings?.getState?.()?.globalLyricTimelineOffsetMs || 0;
-      return (Number(songOffset) || 0) + (Number(globalOffset) || 0);
+      if (typeof localStorage !== 'undefined') {
+        const stored = localStorage.getItem('global_lyric_timeline_offset_ms');
+        const val = Number(stored);
+        if (Number.isFinite(val)) return val;
+      }
+      return 0;
     } catch {
       return 0;
     }
@@ -1653,46 +1643,6 @@ export default function activate(folium) {
     currentSnapshot.theme = nextTheme;
     void pushSnapshot({ theme: nextTheme });
   }));
-
-  // Subscribe to Zustand stores for instant live updates (properly tracked in unsubs)
-  try {
-    const tStore = folium.internals?.stores?.themeSettings;
-    if (tStore?.subscribe) {
-      const unsubTheme = tStore.subscribe(() => {
-        const nextTheme = resolveCurrentTheme();
-        currentSnapshot.theme = nextTheme;
-        void pushSnapshot({ theme: nextTheme });
-      });
-      if (typeof unsubTheme === 'function') unsubs.push(unsubTheme);
-    }
-
-    const pStore = folium.internals?.stores?.playback;
-    if (pStore?.subscribe) {
-      const unsubPlayback = pStore.subscribe((state, prevState) => {
-        if (!state) return;
-        const storeLyrics = state.transitionDisplay?.lyrics || state.lyrics;
-        const prevLyrics = prevState?.transitionDisplay?.lyrics || prevState?.lyrics;
-        if (storeLyrics !== prevLyrics && storeLyrics && Array.isArray(storeLyrics.lines) && storeLyrics.lines.length > 0) {
-          const currentCount = currentSnapshot.lyrics?.lines?.length || 0;
-          const currentFirst = currentSnapshot.lyrics?.lines?.[0]?.fullText;
-          const newFirst = storeLyrics.lines[0]?.fullText || storeLyrics.lines[0]?.text;
-          if (currentCount !== storeLyrics.lines.length || currentFirst !== newFirst) {
-            currentSnapshot.lyrics = formatLyricsLines(storeLyrics.lines);
-            currentSnapshot.lyricOffsetMs = resolveEffectiveLyricOffsetMs();
-            void pushSnapshot({
-              lyrics: currentSnapshot.lyrics,
-              lyricOffsetMs: currentSnapshot.lyricOffsetMs,
-            });
-          }
-        }
-        // Only refresh queue when playQueue reference or currentSong actually changes (not on every lyric line tick)
-        if (state.playQueue !== prevState?.playQueue || state.currentSong !== prevState?.currentSong) {
-          refreshQueue();
-        }
-      });
-      if (typeof unsubPlayback === 'function') unsubs.push(unsubPlayback);
-    }
-  } catch {}
 
   // Initial Sync
   refreshPlaybackState();
