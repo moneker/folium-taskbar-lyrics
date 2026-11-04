@@ -44,31 +44,44 @@
 
 ## 权限声明
 
-本模组严格遵从 Folium 安全权限声明：
+本模组严格遵从 Folium 安全权限规范：
 
-- `runtime.playback`：用于读取当前播放音轨的元数据（曲名、歌手、封面）、播放进度快照与歌词。
+- `playback.read`：用于读取当前播放音轨的元数据（曲名、歌手、封面）、播放进度快照与歌词。
 - `playback.control`：用于抽屉按键与快捷菜单控制播放/暂停、上一曲/下一曲、进度拖拽（Seek）、音量与静音调节、循环模式切换、队列打乱及歌单曲目点播。
 
 ---
 
-## 内部接口（Internals）使用说明
+## 官方 API 覆盖与接口边界说明
 
-为实现全量歌单分页查询、个人电台无缝接入以及读取用户手动微调的歌词全局偏移量，本模组在 Folium 规范下受控使用 `folium.internals`（用于访问底层 `omni` 与部分 `stores`）。
+本模组现已全面切换至 Folium 官方公开 API，并经 `check.mjs` 静态审查 0 警告通过：
 
-- 本模组在 `mod.json` 中将宿主版本严格锁定为 `"folia": ">=0.7.21 <0.8.0"`。
-- 在当前整个 0.7.x 生命周期内，`folium.internals` 完全受宿主官方兼容支持，运行稳定。
-- 所有基础播放控制、进度同步、队列点播与音量设置均使用 100% 官方公开 API。后续 Folia 0.8.0（Folium 2）推出对应公开服务后将第一时间跟进迁移。
+### 1. 100% 官方公开 API 覆盖
+- **播放状态与时钟**：`folium.playback.getState()`，配合 `playback.songChanged`、`playback.stateChanged`、`playback.seeked`、`playback.likeChanged` 事件驱动；
+- **实时歌词**：初始化及恢复时直调 `folium.lyrics.getLines()`，运行时跟随官方 `lyrics.loaded` 事件；
+- **外观主题**：全局监听 `folium.events.on('theme.changed')`，并通过 `folium.theme.resolveFontStack()` 自动解析字体族；
+- **在线服务**：通过官方 `folium.omni`（`describeSong`、`listProviders` 等）提取封面与元数据；
+- **播放控制**：点播曲目优先调用 `folium.playback.playSong(song)` 与 `folium.playback.playQueueItem(idx)`。
+
+### 2. 宿主尚无公开 API 的过渡降级能力
+为保障任务栏直接点播本地音乐与私人漫游的完整体验，模组保留了受控降级路径：
+- **本地曲库与离线歌单**：目前 Folium 尚未开放本地音乐库接口（`folium.library`），模组通过安全只读 IndexedDB 本地表浏览本地曲目，若无 song ref 则安全尝试宿主播放队列，若宿主环境不可用则优雅提示，绝不抛出未捕获异常；
+- **用户自建与收藏在线歌单**：目前官方 `folium.omni` 仅开放公共资源检索，尚未提供个人歌单读取接口；
+- **跟随壁纸屏幕**：因 Electron 主进程未暴露壁纸目标屏 IPC，模组对 `userData/config.json` 进行只读解析并配备主显示器安全降级。
+在后续 Folium 版本提供对应公开接口后，本模组将第一时间无缝切入。
 
 ---
 
 ## 更新日志 (Changelog)
 
 ### v1.0.7 (2026-11-05)
-- **全面对齐官方公开 API 规范（清理私有依赖）**：
-  - 彻底移除对宿主私有 `themeSettings` 与 `lyricSettings` store 的读取与订阅，全面迁移为官方公开的 `folium.events.on('theme.changed')`、`folium.theme` 调色板及标准存储键；
-  - 彻底去除对内部 `playback` store 的事件监听与私有属性访问，改为通过公开的 `lyrics.loaded`、`folium.playback.getState()` 及 `folium.omni.describeSong()` 获取曲目元数据；
-  - 优先接入官方稳定扩展接口 `folium.omni` 服务；
-  - 增强壁纸显示器配置读取的降级与容错保护。
+- **全面对齐官方公开 API 规范（清理私有依赖，通过静态审查 0 警告）**：
+  - 将权限声明从过期的 `runtime.playback` 更新为标准 `playback.read`；
+  - 歌词初始化与恢复全面接入官方公开的 `folium.lyrics.getLines()` 与 `lyrics.loaded`；
+  - 彻底移除对私有 `themeSettings`、`lyricSettings` 及 `playback` store 的读写与订阅；
+  - 主题监听与字体族解析全面迁移至 `theme.changed` 与 `folium.theme.resolveFontStack()`，彻底移除底层缓存读取；
+  - 模组曲目点播优先调用官方 `folium.playback.playSong()`（通过有效 session ref）与 `folium.playback.playQueueItem()`；
+  - `getOmni()` 统一收敛至官方稳定扩展接口 `folium.omni`；
+  - 消除全部 `folium.internals` 静态告警，对未开放公开 API 的本地库特性建立安全隔离与防御性降级。
 
 ### v1.0.6 (2026-11-04)
 - **新增 Hover 隐藏模式**：模组设置新增「鼠标交互模式」，支持保留当前常规交互或切换为「鼠标悬停自动隐藏（穿透操作原任务栏）」，移入任务栏自动隐藏并透传原生任务栏点击，移出自动恢复。

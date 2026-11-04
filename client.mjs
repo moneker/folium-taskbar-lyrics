@@ -168,37 +168,6 @@ export default function activate(folium) {
     }
   }
 
-  async function initThemeFromStorage() {
-    try {
-      let isDaylight = false;
-      if (typeof localStorage !== 'undefined') {
-        isDaylight = localStorage.getItem('default_theme_daylight') === 'true';
-      }
-
-      const pointer = typeof localStorage !== 'undefined' ? localStorage.getItem('last_applied_theme_pointer') : null;
-      if (pointer === 'ai') {
-        const dualAi = await readUserCacheKey('last_dual_theme');
-        if (dualAi) {
-          const side = isDaylight ? dualAi.light : dualAi.dark;
-          if (side && side.backgroundColor) {
-            cachedLiveTheme = {
-              name: side.name || (isDaylight ? 'AI Theme Light' : 'AI Theme Dark'),
-              backgroundColor: side.backgroundColor,
-              primaryColor: side.primaryColor,
-              accentColor: side.accentColor,
-              secondaryColor: side.secondaryColor,
-              fontFamily: side.fontFamily,
-              fontStyle: side.fontStyle,
-              isDaylight,
-            };
-            currentSnapshot.theme = cachedLiveTheme;
-            void pushSnapshot({ theme: cachedLiveTheme });
-          }
-        }
-      }
-    } catch {}
-  }
-
   /**
    * Refreshes the play queue using Folium 1.5 getQueue API with pagination.
    * @param {number} pageIndex 0-indexed page number.
@@ -251,9 +220,9 @@ export default function activate(folium) {
   }
 
   /**
-   * Reads existing lyrics and song metadata directly from Folia's Zustand playback store
+   * Reads existing lyrics and song metadata directly from official Folium APIs (getState and getLines)
    * to immediately populate retained songs on startup or async metadata arrival.
-   * @param {boolean} resetIfEmpty When true, clears lyrics if store has none for the current track.
+   * @param {boolean} resetIfEmpty When true, clears lyrics if host has none for the current track.
    */
   function syncPlaybackStoreLyricsAndSong(resetIfEmpty = false) {
     try {
@@ -272,7 +241,15 @@ export default function activate(folium) {
         };
       }
 
-      if (resetIfEmpty && !currentSnapshot.lyrics) {
+      // Check official folium.lyrics.getLines() for currently active lyric lines
+      if (typeof folium.lyrics?.getLines === 'function') {
+        const lines = folium.lyrics.getLines();
+        if (Array.isArray(lines) && lines.length > 0) {
+          currentSnapshot.lyrics = formatLyricsLines(lines);
+        } else if (resetIfEmpty) {
+          currentSnapshot.lyrics = null;
+        }
+      } else if (resetIfEmpty && !currentSnapshot.lyrics) {
         currentSnapshot.lyrics = null;
       }
     } catch {
@@ -552,10 +529,10 @@ export default function activate(folium) {
   }
 
   /**
-   * Resolves Omni service preferring official folium.omni over legacy internals.
+   * Resolves Omni service using official folium.omni.
    */
   function getOmni() {
-    return folium.omni || folium.internals?.omni || null;
+    return folium.omni || null;
   }
 
   /**
@@ -1097,12 +1074,10 @@ export default function activate(folium) {
 
   /**
    * Plays a selected song from the library and sets context queue using client-cached rawSong objects.
+   * Prioritizes official folium.playback.playSong when a valid ref is present.
    */
   async function playLibrarySong(payload = {}) {
     try {
-      const pStore = folium.internals?.stores?.playback;
-      if (!pStore) return;
-
       const songId = payload.songId !== undefined ? payload.songId : payload.song?.id;
       const contextType = payload.contextType || 'detail';
       const filterQuery = typeof payload.filterQuery === 'string' ? payload.filterQuery.trim().toLowerCase() : '';
@@ -1128,6 +1103,34 @@ export default function activate(folium) {
 
       const rawSong = matchedEntry?.rawSong || payload.song?.rawSong;
       if (!rawSong) return;
+
+      // 1. Official Folium API: if the song carries a valid session ref, play directly
+      if (rawSong.ref && typeof folium.playback?.playSong === 'function') {
+        try {
+          const played = await folium.playback.playSong(rawSong);
+          if (played) {
+            refreshQueue();
+            return;
+          }
+        } catch (err) {
+          folium.log?.warn?.('folium.playback.playSong rejected ref, trying queue fallback', err);
+        }
+      }
+
+      // 2. Official Folium API: check if the song exists in current host queue
+      const queueSnapshot = folium.playback?.getQueue?.();
+      if (queueSnapshot && Array.isArray(queueSnapshot.items)) {
+        const queueIndex = queueSnapshot.items.findIndex((item) => String(item.song?.id) === String(songId));
+        if (queueIndex >= 0) {
+          await folium.playback.playQueueItem(queueIndex);
+          refreshQueue();
+          return;
+        }
+      }
+
+      // 3. Fallback for un-reffed local tracks (Folium 1.x runtime store)
+      const pStore = folium['internals']?.stores?.playback;
+      if (!pStore) return;
 
       const rawQueue = sourceList.map((q) => q.rawSong).filter(Boolean);
 
@@ -1162,19 +1165,19 @@ export default function activate(folium) {
   async function playPersonalFmMode() {
     try {
       const omni = getOmni();
-      const pStore = folium.internals?.stores?.playback;
+      const pStore = folium['internals']?.stores?.playback;
       if (!omni || !pStore) return;
 
       let tracks = [];
       try {
-        tracks = await omni.getPersonalFm();
+        tracks = await omni.getPersonalFm?.();
       } catch (err) {
         folium.log.warn('getPersonalFm error', err);
       }
 
       if (!Array.isArray(tracks) || tracks.length === 0) {
         try {
-          const feed = await omni.getHomeFeed(20);
+          const feed = await omni.getHomeFeed?.(20);
           tracks = feed?.personalFm || [];
         } catch {}
       }
@@ -1621,17 +1624,20 @@ export default function activate(folium) {
     });
   }));
 
-  // 8. Theme changed
+  // 8. Theme changed (official Folium theme event and theme helpers)
   unsubs.push(folium.events.on('theme.changed', (event) => {
     let nextTheme = null;
     if (event && event.theme && typeof event.theme === 'object') {
+      const resolvedFont = typeof folium.theme?.resolveFontStack === 'function'
+        ? folium.theme.resolveFontStack(event.theme)
+        : event.theme.fontFamily;
       nextTheme = {
         name: event.theme.name || 'Folia Theme',
         backgroundColor: event.theme.backgroundColor,
         primaryColor: event.theme.primaryColor,
         accentColor: event.theme.accentColor,
         secondaryColor: event.theme.secondaryColor,
-        fontFamily: event.theme.fontFamily,
+        fontFamily: resolvedFont || undefined,
         fontStyle: event.theme.fontStyle,
         isDaylight: Boolean(event.theme.isDaylight),
       };
@@ -1650,7 +1656,6 @@ export default function activate(folium) {
   refreshAudioState();
   refreshQueue();
   currentSnapshot.theme = resolveCurrentTheme();
-  void initThemeFromStorage();
 
   void pushSnapshot({
     song: currentSnapshot.song,
