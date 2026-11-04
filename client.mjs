@@ -234,6 +234,18 @@ export default function activate(folium) {
           coverUrl = details?.coverUrl || null;
         } catch {}
 
+        if (!coverUrl) {
+          try {
+            const pState = folium['internals']?.stores?.playback?.getState?.();
+            coverUrl = pState?.transitionDisplay?.coverUrl
+              || pState?.cachedCoverUrl
+              || pState?.currentSong?.coverUrl
+              || pState?.currentSong?.album?.coverUrl
+              || pState?.currentSong?.picUrl
+              || null;
+          } catch {}
+        }
+
         currentSnapshot.song = {
           title: hostState.song.title || '未知曲目',
           artist: hostState.song.artist || 'Folia',
@@ -529,10 +541,12 @@ export default function activate(folium) {
   }
 
   /**
-   * Resolves Omni service using official folium.omni.
+   * Resolves Omni service: prefers host omni instance from folium['internals']
+   * (needed for user library playlists, radio feed, and collection tracks),
+   * falling back to official folium.omni.
    */
   function getOmni() {
-    return folium.omni || null;
+    return folium['internals']?.omni || folium.omni || null;
   }
 
   /**
