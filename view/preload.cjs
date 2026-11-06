@@ -36,6 +36,7 @@ contextBridge.exposeInMainWorld('taskbarBridge', {
     return () => ipcRenderer.removeListener('taskbar-lyrics:menu-closed', handler);
   },
   switchDisplay: () => ipcRenderer.send('taskbar-lyrics:switch-display'),
+  moveVertical: (targetY) => ipcRenderer.send('taskbar-lyrics:move-vertical', targetY),
   sendPlaybackAction: (action, payload) => {
     ipcRenderer.send('taskbar-lyrics:playback-action', { action, payload });
   },

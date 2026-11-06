@@ -242,9 +242,11 @@
       if (appRoot.classList.contains('exiting')) {
         appRoot.classList.remove('exiting');
         appRoot.classList.add('collapsed');
-        // Instantly reset drawer panel to right side without transition
+        // Instantly reset drawer panel without transition
         drawerPanel.style.transition = 'none';
-        drawerPanel.style.transform = 'translateX(100%)';
+        drawerPanel.style.transform = appRoot.classList.contains('vertical-taskbar')
+          ? 'translateY(100%)'
+          : 'translateX(100%)';
         void drawerPanel.offsetHeight; // force reflow
         drawerPanel.style.transition = '';
         drawerPanel.style.transform = '';
@@ -256,8 +258,9 @@
     }
   });
 
-  // Toggle button interaction (on far-left)
+  // Toggle button interaction
   let lastToggleTime = 0;
+
   function handleToggleTrigger(e) {
     if (e) {
       e.preventDefault();
@@ -332,6 +335,7 @@
     const pct = (clampedRatio * 100).toFixed(1);
     progressFill.style.width = `${pct}%`;
     progressThumb.style.left = `${pct}%`;
+    progressBar.style.setProperty('--progress-pct', `${pct}%`);
     lastProgressPctStr = pct;
     const sec = Math.floor(targetTime);
     if (sec !== lastDisplayedSecond) {
@@ -347,6 +351,10 @@
 
   function getRatioFromEvent(e) {
     const rect = progressBar.getBoundingClientRect();
+    if (appRoot && appRoot.classList.contains('vertical-taskbar')) {
+      if (rect.height <= 0) return 0;
+      return Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height));
+    }
     if (rect.width <= 0) return 0;
     return Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
   }
@@ -610,10 +618,24 @@
     if (data.playerState !== undefined) snapshot.playerState = nextState;
     snapshot.isAdvancing = nextAdvancing;
     if (data.duration !== undefined) snapshot.duration = data.duration;
-    if (data.lyricOffsetMs !== undefined) snapshot.lyricOffsetMs = data.lyricOffsetMs;
+    if (data.lyricOffsetMs !== undefined) {
+      if (data.lyricOffsetMs !== snapshot.lyricOffsetMs) {
+        isDiscontinuous = true;
+      }
+      snapshot.lyricOffsetMs = data.lyricOffsetMs;
+    }
     snapshot.currentTime = nextCurrentTime;
     snapshot.updatedAt = nextUpdatedAt;
     snapshot.lyrics = nextLyrics;
+
+    if (data.displayInfo) {
+      snapshot.displayInfo = data.displayInfo;
+      const edge = data.displayInfo.taskbarEdge || 'bottom';
+      const isVertical = data.displayInfo.taskbarOrientation === 'vertical';
+      appRoot.classList.toggle('vertical-taskbar', isVertical);
+      appRoot.classList.toggle('edge-left', edge === 'left');
+      appRoot.classList.toggle('edge-right', edge === 'right');
+    }
 
     if (data.settings) {
       snapshot.settings = {
@@ -932,11 +954,13 @@
         lastProgressPctStr = pct;
         progressFill.style.width = `${pct}%`;
         progressThumb.style.left = `${pct}%`;
+        progressBar.style.setProperty('--progress-pct', `${pct}%`);
       }
     } else if (lastProgressPctStr !== '0.0') {
       lastProgressPctStr = '0.0';
       progressFill.style.width = '0%';
       progressThumb.style.left = '0%';
+      progressBar.style.setProperty('--progress-pct', '0%');
     }
 
     const lyricTime = getEffectiveLyricTime();

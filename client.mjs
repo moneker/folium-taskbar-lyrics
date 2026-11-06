@@ -1377,12 +1377,37 @@ export default function activate(folium) {
 
   function resolveEffectiveLyricOffsetMs() {
     try {
-      if (typeof localStorage !== 'undefined') {
+      let songOffset = 0;
+      try {
+        const pState = folium['internals']?.stores?.playback?.getState?.();
+        if (pState && typeof pState.lyricTimelineOffsetMs === 'number' && Number.isFinite(pState.lyricTimelineOffsetMs)) {
+          songOffset = pState.lyricTimelineOffsetMs;
+        }
+      } catch {
+        // Ignored
+      }
+
+      let globalOffset = 0;
+      let hasStoreGlobal = false;
+      try {
+        const lState = folium['internals']?.stores?.lyricSettings?.getState?.();
+        if (lState && typeof lState.globalLyricTimelineOffsetMs === 'number' && Number.isFinite(lState.globalLyricTimelineOffsetMs)) {
+          globalOffset = lState.globalLyricTimelineOffsetMs;
+          hasStoreGlobal = true;
+        }
+      } catch {
+        // Ignored
+      }
+
+      if (!hasStoreGlobal && typeof localStorage !== 'undefined') {
         const stored = localStorage.getItem('global_lyric_timeline_offset_ms');
         const val = Number(stored);
-        if (Number.isFinite(val)) return val;
+        if (Number.isFinite(val)) {
+          globalOffset = val;
+        }
       }
-      return 0;
+
+      return songOffset + globalOffset;
     } catch {
       return 0;
     }
@@ -1664,12 +1689,50 @@ export default function activate(folium) {
     void pushSnapshot({ theme: nextTheme });
   }));
 
+  // 9. Per-song & global lyric timeline offset changes
+  try {
+    const pStore = folium['internals']?.stores?.playback;
+    if (typeof pStore?.subscribe === 'function') {
+      let prevSongOffset = pStore.getState?.()?.lyricTimelineOffsetMs;
+      unsubs.push(pStore.subscribe((state) => {
+        const nextSongOffset = state?.lyricTimelineOffsetMs;
+        if (typeof nextSongOffset === 'number' && nextSongOffset !== prevSongOffset) {
+          prevSongOffset = nextSongOffset;
+          const nextEffective = resolveEffectiveLyricOffsetMs();
+          if (nextEffective !== currentSnapshot.lyricOffsetMs) {
+            currentSnapshot.lyricOffsetMs = nextEffective;
+            void pushSnapshot({ lyricOffsetMs: nextEffective });
+          }
+        }
+      }));
+    }
+
+    const lStore = folium['internals']?.stores?.lyricSettings;
+    if (typeof lStore?.subscribe === 'function') {
+      let prevGlobalOffset = lStore.getState?.()?.globalLyricTimelineOffsetMs;
+      unsubs.push(lStore.subscribe((state) => {
+        const nextGlobalOffset = state?.globalLyricTimelineOffsetMs;
+        if (typeof nextGlobalOffset === 'number' && nextGlobalOffset !== prevGlobalOffset) {
+          prevGlobalOffset = nextGlobalOffset;
+          const nextEffective = resolveEffectiveLyricOffsetMs();
+          if (nextEffective !== currentSnapshot.lyricOffsetMs) {
+            currentSnapshot.lyricOffsetMs = nextEffective;
+            void pushSnapshot({ lyricOffsetMs: nextEffective });
+          }
+        }
+      }));
+    }
+  } catch {
+    // Ignored
+  }
+
   // Initial Sync
   refreshPlaybackState();
   syncPlaybackStoreLyricsAndSong();
   refreshAudioState();
   refreshQueue();
   currentSnapshot.theme = resolveCurrentTheme();
+  currentSnapshot.lyricOffsetMs = resolveEffectiveLyricOffsetMs();
 
   void pushSnapshot({
     song: currentSnapshot.song,
@@ -1677,6 +1740,7 @@ export default function activate(folium) {
     isAdvancing: currentSnapshot.isAdvancing,
     currentTime: currentSnapshot.currentTime,
     duration: currentSnapshot.duration,
+    lyricOffsetMs: currentSnapshot.lyricOffsetMs,
     updatedAt: currentSnapshot.updatedAt,
     lyrics: currentSnapshot.lyrics,
     queue: currentSnapshot.queue,

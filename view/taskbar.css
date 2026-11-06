@@ -212,6 +212,257 @@ html, body {
   transition: transform 0.32s var(--drawer-easing-out), opacity 0.22s ease;
 }
 
+/* ======================================================== */
+/* Vertical Taskbar (Left / Right) Layout & Vertical Lyrics */
+/* ======================================================== */
+.app-root.vertical-taskbar .toggle-button {
+  left: 50%;
+  right: auto;
+  top: 6px;
+  transform: translateX(-50%);
+  width: 36px;
+  height: 44px;
+  border-radius: 18px;
+  cursor: pointer;
+}
+
+.app-root.vertical-taskbar .toggle-button:hover {
+  transform: translateX(-50%) scale(1.05);
+}
+
+.app-root.vertical-taskbar .toggle-button:active {
+  transform: translateX(-50%) scale(0.95);
+}
+
+.app-root.vertical-taskbar .toggle-icon-container {
+  flex-direction: column;
+  gap: 2px;
+}
+
+.app-root.vertical-taskbar .chevron-icon {
+  transform: rotate(90deg);
+}
+
+.app-root.vertical-taskbar.expanded .chevron-icon {
+  transform: rotate(-90deg);
+}
+
+.app-root.vertical-taskbar .drawer-panel {
+  flex-direction: column;
+  padding: 58px 4px 12px 4px;
+  transform: translateY(100%);
+}
+
+.app-root.vertical-taskbar.hover-hide-mode .drawer-panel {
+  padding-top: 14px;
+  padding-left: 4px;
+}
+
+.app-root.vertical-taskbar.expanded .drawer-panel {
+  transform: translateY(0);
+}
+
+.app-root.vertical-taskbar.exiting .drawer-panel {
+  transform: translateY(-100%);
+}
+
+.app-root.vertical-taskbar .song-meta-section {
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+}
+
+.app-root.vertical-taskbar .cover-container {
+  width: 34px;
+  height: 34px;
+}
+
+.app-root.vertical-taskbar .meta-texts {
+  display: none;
+}
+
+.app-root.vertical-taskbar .lyrics-stage-section {
+  left: 50%;
+  top: 96px;
+  bottom: 242px;
+  transform: translateX(-50%);
+  width: 100%;
+  max-width: 100%;
+  height: auto;
+  max-height: none;
+  flex-direction: row-reverse;
+  align-items: center;
+  justify-content: center;
+  padding: 8px 0;
+  gap: 2px;
+}
+
+.app-root.vertical-taskbar.hover-hide-mode .lyrics-stage-section {
+  top: 56px;
+}
+
+.app-root.vertical-taskbar .lyrics-row {
+  width: auto;
+  height: 100%;
+  flex-direction: column;
+}
+
+.app-root.vertical-taskbar .primary-row {
+  width: 22px;
+  height: auto;
+}
+
+.app-root.vertical-taskbar .lyrics-stage-section.single-row .primary-row {
+  width: 32px;
+  height: auto;
+}
+
+.app-root.vertical-taskbar .secondary-row {
+  width: 14px;
+  height: auto;
+  margin-top: 0;
+}
+
+.app-root.vertical-taskbar .lyric-main {
+  writing-mode: vertical-rl;
+  text-orientation: mixed;
+  font-size: 14.5px;
+  letter-spacing: 1.5px;
+  max-width: none;
+  max-height: 100%;
+  background: linear-gradient(
+    to bottom,
+    var(--text-primary) 0%,
+    var(--text-primary) calc(var(--wipe-pct, 0%) - 1%),
+    var(--accent-color) var(--wipe-pct, 0%),
+    var(--lyric-inactive) calc(var(--wipe-pct, 0%) + 1.2%),
+    var(--lyric-inactive) 100%
+  );
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  transform: translateX(0);
+}
+
+.app-root.vertical-taskbar .lyrics-stage-section.single-row .lyric-main {
+  font-size: 15.5px;
+  letter-spacing: 1.8px;
+}
+
+.app-root.vertical-taskbar .lyric-main.line-switching {
+  transform: translateX(-2px);
+}
+
+.app-root.vertical-taskbar .lyric-sub {
+  writing-mode: vertical-rl;
+  text-orientation: mixed;
+  font-size: 11px;
+  letter-spacing: 1px;
+  max-width: none;
+  max-height: 100%;
+}
+
+.app-root.vertical-taskbar .controls-section {
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  margin-left: 0;
+  margin-top: auto;
+}
+
+.app-root.vertical-taskbar .progress-container {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+}
+
+.app-root.vertical-taskbar .time-label {
+  font-size: 9px;
+  min-width: auto;
+  line-height: 1;
+}
+
+.app-root.vertical-taskbar .progress-track {
+  width: 4px;
+  height: 48px;
+  transition: width 0.15s ease, background-color 0.15s ease;
+}
+
+.app-root.vertical-taskbar .progress-track:hover {
+  width: 6px;
+  height: 48px;
+}
+
+.app-root.vertical-taskbar .progress-fill {
+  width: 100% !important;
+  height: var(--progress-pct, 0%) !important;
+}
+
+.app-root.vertical-taskbar .progress-thumb {
+  left: 50% !important;
+  top: var(--progress-pct, 0%) !important;
+}
+
+.app-root.vertical-taskbar .buttons-group {
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+}
+
+.app-root.vertical-taskbar .action-btn {
+  width: 30px;
+  height: 30px;
+}
+
+.app-root.vertical-taskbar .play-pause-btn {
+  width: 34px;
+  height: 34px;
+}
+
+.app-root.vertical-taskbar .drawer-cover-overlay {
+  background: linear-gradient(
+    180deg,
+    rgba(12, 12, 18, 0.88) 0%,
+    rgba(12, 12, 18, 0.6) 35%,
+    rgba(12, 12, 18, 0.6) 65%,
+    rgba(12, 12, 18, 0.88) 100%
+  );
+}
+
+.app-root.vertical-taskbar.daylight .drawer-cover-overlay {
+  background: linear-gradient(
+    180deg,
+    rgba(245, 245, 248, 0.90) 0%,
+    rgba(245, 245, 248, 0.68) 35%,
+    rgba(245, 245, 248, 0.68) 65%,
+    rgba(245, 245, 248, 0.90) 100%
+  );
+}
+
+.app-root.vertical-taskbar .drawer-bg-acrylic {
+  box-shadow: inset 1px 0 0 rgba(255, 255, 255, 0.14);
+}
+
+.app-root.vertical-taskbar.edge-left .drawer-bg-acrylic {
+  box-shadow: inset -1px 0 0 rgba(255, 255, 255, 0.14);
+}
+
+.app-root.vertical-taskbar .drawer-highlight-edge {
+  top: 0;
+  bottom: 0;
+  left: 0;
+  right: auto;
+  width: 1px;
+  height: 100%;
+  background: linear-gradient(180deg, transparent 0%, rgba(255, 255, 255, 0.24) 15%, rgba(255, 255, 255, 0.24) 85%, transparent 100%);
+}
+
+.app-root.vertical-taskbar.edge-left .drawer-highlight-edge {
+  left: auto;
+  right: 0;
+}
+
 /* Folia Lyrics Stage Fluid Cover Background */
 .drawer-bg-container {
   position: absolute;
