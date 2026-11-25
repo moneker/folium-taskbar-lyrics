@@ -155,28 +155,48 @@
   // Dynamic Folia Theme Palette Derivation
   // =========================================================================
 
-  function colorWithAlpha(colorStr, alpha) {
-    if (!colorStr) return `rgba(255, 255, 255, ${alpha})`;
+  function parseRgbChannels(colorStr) {
+    if (!colorStr) return null;
     let hex = String(colorStr).trim();
     if (hex.startsWith('rgba') || hex.startsWith('rgb')) {
       const m = hex.match(/\d+(\.\d+)?/g);
       if (m && m.length >= 3) {
-        return `rgba(${m[0]}, ${m[1]}, ${m[2]}, ${alpha})`;
+        return [Number(m[0]) || 0, Number(m[1]) || 0, Number(m[2]) || 0];
       }
     }
-    if (hex.startsWith('#')) {
-      hex = hex.slice(1);
-    }
-    if (hex.length === 3) {
-      hex = hex.split('').map((c) => c + c).join('');
-    }
+    if (hex.startsWith('#')) hex = hex.slice(1);
+    if (hex.length === 3) hex = hex.split('').map((c) => c + c).join('');
     if (hex.length >= 6) {
-      const r = parseInt(hex.substring(0, 2), 16) || 0;
-      const g = parseInt(hex.substring(2, 4), 16) || 0;
-      const b = parseInt(hex.substring(4, 6), 16) || 0;
-      return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+      return [
+        parseInt(hex.substring(0, 2), 16) || 0,
+        parseInt(hex.substring(2, 4), 16) || 0,
+        parseInt(hex.substring(4, 6), 16) || 0,
+      ];
+    }
+    return null;
+  }
+
+  function colorWithAlpha(colorStr, alpha) {
+    const rgb = parseRgbChannels(colorStr);
+    if (rgb) {
+      return `rgba(${rgb[0]}, ${rgb[1]}, ${rgb[2]}, ${alpha})`;
     }
     return `rgba(255, 255, 255, ${alpha})`;
+  }
+
+  // Lifts dark theme accents toward white so hover rim & icon glow stay luminous instead of muddy
+  function ensureLuminousHex(colorStr, isDaylight) {
+    const rgb = parseRgbChannels(colorStr);
+    if (!rgb) return isDaylight ? '#ea580c' : '#a5b4fc';
+    let [r, g, b] = rgb;
+    const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+    if (!isDaylight && lum < 150) {
+      const lift = Math.min(0.62, (165 - lum) / 220);
+      r = Math.round(r + (255 - r) * lift);
+      g = Math.round(g + (255 - g) * lift);
+      b = Math.round(b + (255 - b) * lift);
+    }
+    return `rgb(${r}, ${g}, ${b})`;
   }
 
   function applyTheme(theme) {
@@ -197,6 +217,8 @@
     const primary = theme.primaryColor || (isDaylight ? '#1c1917' : '#f4f4f5');
     const secondary = theme.secondaryColor || (isDaylight ? '#44403c' : '#71717a');
     const accent = theme.accentColor || (isDaylight ? '#ea580c' : '#6366f1');
+    const luminousAccent = ensureLuminousHex(accent, isDaylight);
+    const luminousPrimary = ensureLuminousHex(primary, isDaylight);
 
     rootStyle.setProperty('--bg-acrylic', colorWithAlpha(bg, isDaylight ? 0.95 : 0.94));
     rootStyle.setProperty('--bg-card', colorWithAlpha(primary, isDaylight ? 0.05 : 0.08));
@@ -212,8 +234,27 @@
     rootStyle.setProperty('--accent-glow', colorWithAlpha(accent, 0.45));
     rootStyle.setProperty('--accent-gradient', `linear-gradient(135deg, ${accent}, ${colorWithAlpha(accent, 0.8)})`);
 
+    // Left toggle button: transparent idle + luminous rim & icon glow on hover
+    rootStyle.setProperty('--toggle-idle-fg', colorWithAlpha(isDaylight ? primary : luminousPrimary, isDaylight ? 0.52 : 0.58));
+    rootStyle.setProperty('--toggle-hover-fg', isDaylight ? primary : '#ffffff');
+    rootStyle.setProperty('--toggle-hover-surface', colorWithAlpha(luminousPrimary, isDaylight ? 0.06 : 0.035));
+    rootStyle.setProperty('--toggle-hover-border', colorWithAlpha(luminousPrimary, isDaylight ? 0.26 : 0.38));
+    rootStyle.setProperty('--toggle-rim-highlight', isDaylight ? 'rgba(255, 255, 255, 0.82)' : 'rgba(255, 255, 255, 0.52)');
+    rootStyle.setProperty('--toggle-edge-glow', colorWithAlpha(luminousAccent, isDaylight ? 0.28 : 0.46));
+    rootStyle.setProperty('--toggle-edge-inner', colorWithAlpha(luminousPrimary, isDaylight ? 0.16 : 0.18));
+    rootStyle.setProperty('--toggle-icon-glow', isDaylight ? colorWithAlpha(luminousAccent, 0.42) : colorWithAlpha(luminousAccent, 0.72));
+    rootStyle.setProperty(
+      '--toggle-bar-hover',
+      isDaylight
+        ? `linear-gradient(180deg, ${primary} 0%, ${luminousAccent} 100%)`
+        : `linear-gradient(180deg, #ffffff 0%, ${luminousPrimary} 52%, ${luminousAccent} 100%)`,
+    );
+
     if (theme.fontFamily) {
       rootStyle.setProperty('--app-font-family', theme.fontFamily);
+    }
+    if (theme.translationFontFamily) {
+      rootStyle.setProperty('--app-sub-font-family', theme.translationFontFamily);
     }
   }
 
@@ -768,17 +809,20 @@
       const endTime = typeof line.endTime === 'number' && line.endTime > start
         ? line.endTime
         : nextStart;
+      const holdEndTime = typeof line.renderEndTime === 'number' && line.renderEndTime > endTime
+        ? Math.min(nextStart, line.renderEndTime)
+        : endTime;
 
-      // Currently inside this line's singing window
-      if (time <= endTime) {
+      // Currently inside this line's singing or host-hinted hold window
+      if (time <= holdEndTime) {
         return { index: i, line, isInterlude: false };
       }
 
       // Between this line and the next line
       if (nextLine) {
-        const gap = nextStart - endTime;
-        // If there is a noticeable break (>= 2.0s) and we are past the line end by at least 0.8s
-        if (gap >= 2.0 && (time - endTime) >= 0.8 && time < nextStart) {
+        const gap = nextStart - holdEndTime;
+        // If there is a noticeable break (>= 2.0s) and we are past the hold end by at least 0.8s
+        if (gap >= 2.0 && (time - holdEndTime) >= 0.8 && time < nextStart) {
           return { index: -1, line: null, isInterlude: true };
         }
         // Otherwise hold this line until next line starts
@@ -787,7 +831,7 @@
         }
       } else {
         // Outro: after the last line finishes
-        if (time > endTime + 2.0) {
+        if (time > holdEndTime + 2.0) {
           return { index: -1, line: null, isInterlude: true };
         }
         return { index: i, line, isInterlude: false };

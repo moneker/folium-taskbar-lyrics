@@ -9,10 +9,13 @@
 
 /**
  * Taskbar Lyrics Client Entry
- * @param {import('../../src/mods/folium/contract').FoliumClientApi} folium
+ * @param {import('../folium').FoliumClientApi} folium
  */
 export default function activate(folium) {
-  // Enforce Windows platform limitation
+  // Enforce main-window & Windows platform limitations (skip video export contexts cleanly)
+  if (folium.env?.context && folium.env.context !== 'main') {
+    return () => {};
+  }
   if (typeof process !== 'undefined' && process.platform && process.platform !== 'win32') {
     return () => {};
   }
@@ -20,12 +23,156 @@ export default function activate(folium) {
     return () => {};
   }
 
-  folium.log.info(`Taskbar Lyrics Drawer client activating for mod ${folium.modId}`);
+  folium.log.info(`Taskbar Lyrics client activating for mod ${folium.modId}`);
 
-  // Feature detection: Folium 1.5+ provides native volume, loop mode and queue controls
-  const hasPlaybackControls = (folium.host?.folium?.minor ?? 0) >= 5;
+  // Feature detection across Folium 1.5–1.10 and Folium 2.x (where minor resets to 0/1)
+  const foliumMajor = folium.host?.folium?.major ?? 1;
+  const foliumMinor = folium.host?.folium?.minor ?? 0;
+  const hasFoliumAtLeast = (targetMajor, targetMinor) => (
+    foliumMajor > targetMajor || (foliumMajor === targetMajor && foliumMinor >= targetMinor)
+  );
+  const hasPlaybackControls = hasFoliumAtLeast(1, 5);
+  const hasOmniApi = hasFoliumAtLeast(1, 7) && Boolean(folium.omni);
+  const hasRpcPush = hasFoliumAtLeast(1, 7) && typeof folium.rpc?.on === 'function';
+  const hasReplaceQueueApi = hasFoliumAtLeast(1, 7) && typeof folium.playback?.replaceQueue === 'function';
+  const hasThemeCurrentApi = hasFoliumAtLeast(1, 10) && typeof folium.theme?.getCurrent === 'function';
   const QUEUE_PAGE_SIZE = 50;
   let currentQueuePageIndex = 0;
+  let isDisposed = false;
+  const pendingPlayTimers = new Set();
+
+  // Built-in sources in Folia 0.8.0 used alongside dynamic listProviders() when scanning caches
+  const BUILTIN_SNAPSHOT_PROVIDERS = [
+    'netease', 'kugou', 'qq', 'bodian',
+    'qishui', 'ytm', 'spotify', 'appleMusic', 'fnmusic', 'lxmusic',
+  ];
+
+  function tryGetInternalStores() {
+    try {
+      return folium['internals']?.stores || null;
+    } catch {
+      return null;
+    }
+  }
+
+  function getProviderIdOf(providerInfo) {
+    return providerInfo?.providerId || providerInfo?.id || null;
+  }
+
+  function getKnownSnapshotProviderIds() {
+    const ordered = [];
+    const seen = new Set();
+    const pushId = (id) => {
+      if (typeof id === 'string' && id && !seen.has(id)) {
+        seen.add(id);
+        ordered.push(id);
+      }
+    };
+    if (hasOmniApi && typeof folium.omni?.listProviders === 'function') {
+      try {
+        const listed = folium.omni.listProviders() || [];
+        listed.filter((p) => p?.selected).forEach((p) => pushId(getProviderIdOf(p)));
+        listed.forEach((p) => pushId(getProviderIdOf(p)));
+      } catch {}
+    }
+    BUILTIN_SNAPSHOT_PROVIDERS.forEach(pushId);
+    return ordered;
+  }
+
+  function formatLocalSongMeta(song) {
+    const useImport = song?.titleOrigin === 'import';
+    const importedArtists = Array.isArray(song?.importedMetadata?.artistNames)
+      ? song.importedMetadata.artistNames.filter(Boolean)
+      : [];
+    const onlineArtists = Array.isArray(song?.onlineMetadata?.artists)
+      ? song.onlineMetadata.artists.map((a) => a?.name).filter(Boolean)
+      : [];
+    const artistNames = useImport
+      ? (importedArtists.length > 0 ? importedArtists : onlineArtists)
+      : (onlineArtists.length > 0 ? onlineArtists : importedArtists);
+    const artist = artistNames.length > 0 ? artistNames.join(' / ') : (song?.artist || '本地音乐');
+
+    const importedAlbum = song?.importedMetadata?.albumName || '';
+    const onlineAlbum = song?.onlineMetadata?.album?.name || '';
+    const fallbackAlbum = song?.album?.name || (typeof song?.album === 'string' ? song.album : '');
+    const albumName = useImport
+      ? (importedAlbum || onlineAlbum || fallbackAlbum)
+      : (onlineAlbum || importedAlbum || fallbackAlbum);
+
+    const rawDurationMs = typeof song?.durationMs === 'number'
+      ? song.durationMs
+      : (typeof song?.duration === 'number' ? song.duration : 0);
+    const durationSec = rawDurationMs > 0 ? Math.round(rawDurationMs / 1000) : 0;
+    const durationMs = rawDurationMs > 0 ? rawDurationMs : 0;
+    const title = song?.title || song?.name || '未知曲目';
+
+    return { title, artist, albumName, durationSec, durationMs };
+  }
+
+  function resolveLocalCoverUrl(song) {
+    const assetId = song?.localCoverAssetId;
+    const localUrl = typeof assetId === 'string' && assetId
+      ? `folia-cover://asset/${encodeURIComponent(assetId)}`
+      : '';
+    const onlineCover = song?.onlineMetadata?.coverUrl || '';
+    if (song?.useOnlineCover) {
+      return onlineCover || localUrl;
+    }
+    return localUrl || onlineCover;
+  }
+
+  function buildLocalSongEntry(s) {
+    const meta = formatLocalSongMeta(s);
+    const coverUrl = resolveLocalCoverUrl(s);
+    return {
+      id: s.id,
+      title: meta.title,
+      artist: meta.artist,
+      album: meta.albumName,
+      duration: meta.durationSec,
+      rawSong: {
+        id: s.id,
+        name: meta.title,
+        artists: [{ id: 0, name: meta.artist }],
+        album: {
+          id: 0,
+          name: meta.albumName,
+          ...(coverUrl ? { coverUrl } : {}),
+        },
+        durationMs: meta.durationMs,
+        isLocal: true,
+        localRef: { songId: s.id },
+        sourceRef: { kind: 'local', mediaId: s.id },
+      },
+    };
+  }
+
+  function formatRawSongEntry(song, rawSongOverride = song) {
+    const artist = Array.isArray(song?.artists)
+      ? song.artists.map((a) => a?.name).filter(Boolean).join(' / ') || '未知艺人'
+      : (song?.artist || '未知艺人');
+    const durSec = typeof song?.durationMs === 'number'
+      ? Math.round(song.durationMs / 1000)
+      : (typeof song?.duration === 'number' ? song.duration : 0);
+    return {
+      id: song?.id,
+      title: song?.name || song?.title || '未知曲目',
+      artist,
+      album: song?.album?.name || '',
+      duration: durSec,
+      rawSong: rawSongOverride,
+    };
+  }
+
+  function applyInternalPlaybackQueue(pStore, queue, isFmMode) {
+    const state = pStore.getState();
+    if (typeof state.replacePlayQueue === 'function') {
+      state.replacePlayQueue(queue, isFmMode);
+      return;
+    }
+    state.setIsFmMode(isFmMode);
+    state.setPlayQueue(queue);
+  }
 
   // In-memory raw item caches kept exclusively in client.mjs to avoid cloning large rawSong/rawCollection
   // graphs across IPC into main process, taskbarWindow, and menuWindow.
@@ -77,6 +224,7 @@ export default function activate(folium) {
    * @param {object} delta Fields to merge and synchronize.
    */
   async function pushSnapshot(delta = {}) {
+    if (isDisposed) return;
     try {
       const hasTime = typeof delta.currentTime === 'number' && Number.isFinite(delta.currentTime);
       const nextUpdatedAt = hasTime ? (delta.updatedAt || Date.now()) : currentSnapshot.updatedAt;
@@ -93,14 +241,68 @@ export default function activate(folium) {
   }
 
   let cachedLiveTheme = null;
+  let hasReceivedThemeEvent = false;
 
   /**
-   * Resolves the active Folia theme including daylight/dark mode and palette colors.
+   * Normalizes a FoliumTheme object via folium.theme.resolveFontStack().
+   */
+  function normalizeThemeSnapshot(theme) {
+    if (!theme || typeof theme !== 'object') return null;
+    let resolvedFont = theme.fontFamily;
+    let resolvedSubFont;
+    try {
+      if (typeof folium.theme?.resolveFontStack === 'function') {
+        resolvedFont = folium.theme.resolveFontStack(theme);
+      }
+      if (typeof folium.theme?.resolveTranslationFontStack === 'function') {
+        resolvedSubFont = folium.theme.resolveTranslationFontStack(theme);
+      }
+    } catch {}
+    return {
+      name: theme.name || 'Folia Theme',
+      backgroundColor: theme.backgroundColor,
+      primaryColor: theme.primaryColor,
+      accentColor: theme.accentColor,
+      secondaryColor: theme.secondaryColor,
+      fontFamily: resolvedFont || undefined,
+      translationFontFamily: resolvedSubFont || undefined,
+      fontStyle: theme.fontStyle || 'sans',
+      isDaylight: Boolean(theme.isDaylight),
+    };
+  }
+
+  function sameThemeSnapshot(a, b) {
+    if (a === b) return true;
+    if (!a || !b) return false;
+    return a.name === b.name
+      && a.backgroundColor === b.backgroundColor
+      && a.primaryColor === b.primaryColor
+      && a.accentColor === b.accentColor
+      && a.secondaryColor === b.secondaryColor
+      && a.fontFamily === b.fontFamily
+      && a.translationFontFamily === b.translationFontFamily
+      && a.fontStyle === b.fontStyle
+      && Boolean(a.isDaylight) === Boolean(b.isDaylight);
+  }
+
+  /**
+   * Resolves the active Folia theme using Folium 1.10 folium.theme.getCurrent()
+   * when available, falling back cleanly for older Folium 1.8/1.9 hosts.
    */
   function resolveCurrentTheme() {
     try {
-      if (cachedLiveTheme) {
+      if (hasReceivedThemeEvent && cachedLiveTheme) {
         return cachedLiveTheme;
+      }
+
+      if (hasThemeCurrentApi) {
+        try {
+          const liveTheme = normalizeThemeSnapshot(folium.theme.getCurrent());
+          if (liveTheme && liveTheme.backgroundColor) {
+            cachedLiveTheme = liveTheme;
+            return liveTheme;
+          }
+        } catch {}
       }
 
       let isDaylight = false;
@@ -204,18 +406,32 @@ export default function activate(folium) {
   function formatLyricsLines(lines) {
     if (!Array.isArray(lines) || lines.length === 0) return null;
     return {
-      lines: lines.map((line) => ({
-        startTime: typeof line.startTime === 'number' ? line.startTime : 0,
-        endTime: typeof line.endTime === 'number' ? line.endTime : 0,
-        fullText: line.fullText || line.text || '',
-        text: line.fullText || line.text || '',
-        translation: line.translation || '',
-        words: Array.isArray(line.words) ? line.words.map((w) => ({
-          text: w.text || '',
-          startTime: typeof w.startTime === 'number' ? w.startTime : 0,
-          endTime: typeof w.endTime === 'number' ? w.endTime : 0,
-        })) : null,
-      })),
+      lines: lines.map((line) => {
+        let renderEndTime;
+        if (typeof line?.renderHints?.renderEndTime === 'number' && Number.isFinite(line.renderHints.renderEndTime)) {
+          renderEndTime = line.renderHints.renderEndTime;
+        } else if (typeof folium.lyrics?.getLineRenderEndTime === 'function') {
+          try {
+            const hinted = folium.lyrics.getLineRenderEndTime(line);
+            if (typeof hinted === 'number' && Number.isFinite(hinted)) {
+              renderEndTime = hinted;
+            }
+          } catch {}
+        }
+        return {
+          startTime: typeof line.startTime === 'number' ? line.startTime : 0,
+          endTime: typeof line.endTime === 'number' ? line.endTime : 0,
+          ...(renderEndTime !== undefined ? { renderEndTime } : {}),
+          fullText: line.fullText || line.text || '',
+          text: line.fullText || line.text || '',
+          translation: line.translation || '',
+          words: Array.isArray(line.words) ? line.words.map((w) => ({
+            text: w.text || '',
+            startTime: typeof w.startTime === 'number' ? w.startTime : 0,
+            endTime: typeof w.endTime === 'number' ? w.endTime : 0,
+          })) : null,
+        };
+      }),
     };
   }
 
@@ -236,7 +452,7 @@ export default function activate(folium) {
 
         if (!coverUrl) {
           try {
-            const pState = folium['internals']?.stores?.playback?.getState?.();
+            const pState = tryGetInternalStores()?.playback?.getState?.();
             coverUrl = pState?.transitionDisplay?.coverUrl
               || pState?.cachedCoverUrl
               || pState?.currentSong?.coverUrl
@@ -455,14 +671,23 @@ export default function activate(folium) {
   }
 
   // =========================================================================
-  // IndexedDB Helpers for KineticPlayerDB
+  // IndexedDB Helpers for KineticPlayerDB & FoliaPlaylistsDB
   // =========================================================================
 
-  function openKineticPlayerDb() {
-    return new Promise((resolve) => {
+  function openExistingIndexedDb(dbName = 'KineticPlayerDB', createIfMissing = false) {
+    return new Promise(async (resolve) => {
       try {
         if (typeof indexedDB === 'undefined') return resolve(null);
-        const req = indexedDB.open('KineticPlayerDB');
+        // Never implicitly create FoliaPlaylistsDB before Folia initializes Dexie schema v1
+        if (!createIfMissing && typeof indexedDB.databases === 'function') {
+          try {
+            const dbs = await indexedDB.databases();
+            if (Array.isArray(dbs) && !dbs.some((entry) => entry?.name === dbName)) {
+              return resolve(null);
+            }
+          } catch {}
+        }
+        const req = indexedDB.open(dbName);
         req.onerror = () => resolve(null);
         req.onsuccess = () => resolve(req.result);
       } catch {
@@ -471,10 +696,10 @@ export default function activate(folium) {
     });
   }
 
-  function readIndexedDbTable(tableName) {
+  function readIndexedDbTable(tableName, dbName = 'KineticPlayerDB') {
     return new Promise(async (resolve) => {
       try {
-        const db = await openKineticPlayerDb();
+        const db = await openExistingIndexedDb(dbName, false);
         if (!db || !db.objectStoreNames.contains(tableName)) {
           if (db) db.close();
           return resolve([]);
@@ -496,30 +721,47 @@ export default function activate(folium) {
     });
   }
 
-  function readUserCacheKey(key) {
+  function readCacheKeyFromStores(key, storeNames = ['user_cache']) {
     return new Promise(async (resolve) => {
       try {
-        const db = await openKineticPlayerDb();
-        if (!db || !db.objectStoreNames.contains('user_cache')) {
-          if (db) db.close();
+        const db = await openExistingIndexedDb('KineticPlayerDB', false);
+        if (!db) return resolve(null);
+        const available = storeNames.filter((name) => db.objectStoreNames.contains(name));
+        if (available.length === 0) {
+          db.close();
           return resolve(null);
         }
-        const tx = db.transaction('user_cache', 'readonly');
-        const store = tx.objectStore('user_cache');
-        const getReq = store.get(key);
-        getReq.onsuccess = () => {
-          db.close();
-          const res = getReq.result;
-          resolve(res ? res.data : null);
-        };
-        getReq.onerror = () => {
-          db.close();
-          resolve(null);
-        };
+
+        const readFromStore = (storeName) => new Promise((innerResolve) => {
+          try {
+            const tx = db.transaction(storeName, 'readonly');
+            const store = tx.objectStore(storeName);
+            const getReq = store.get(key);
+            getReq.onsuccess = () => {
+              const res = getReq.result;
+              innerResolve(res ? res.data : null);
+            };
+            getReq.onerror = () => innerResolve(null);
+          } catch {
+            innerResolve(null);
+          }
+        });
+
+        let found = null;
+        for (const storeName of available) {
+          found = await readFromStore(storeName);
+          if (found != null) break;
+        }
+        db.close();
+        resolve(found);
       } catch {
         resolve(null);
       }
     });
+  }
+
+  function readUserCacheKey(key) {
+    return readCacheKeyFromStores(key, ['user_cache']);
   }
 
   // =========================================================================
@@ -541,12 +783,16 @@ export default function activate(folium) {
   }
 
   /**
-   * Resolves Omni service: prefers host omni instance from folium['internals']
-   * (needed for user library playlists, radio feed, and collection tracks),
-   * falling back to official folium.omni.
+   * Transitional host Omni helper reserved ONLY for capabilities not yet in official folium.omni
+   * (user playlists/saved albums, provider summaries, home feed, and Personal FM).
+   * Public catalog reads (describeSong, resolveCollection, album getTracks, resolveSongs) use folium.omni.
    */
-  function getOmni() {
-    return folium['internals']?.omni || folium.omni || null;
+  function getLegacyInternalOmni() {
+    try {
+      return folium['internals']?.omni || null;
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -554,7 +800,7 @@ export default function activate(folium) {
    * Stores raw objects in cachedCollectionMap and returns lightweight DTOs for IPC.
    */
   async function getLibraryPlaylists() {
-    const omni = getOmni();
+    const omni = getLegacyInternalOmni();
     const list = [];
     const seenKeys = new Set();
 
@@ -626,7 +872,7 @@ export default function activate(folium) {
 
     // 3. Fallback: check IndexedDB user_cache for provider snapshots
     if (list.length === 0) {
-      const providers = ['netease', 'kugou', 'qq', 'bodian'];
+      const providers = getKnownSnapshotProviderIds();
       for (const p of providers) {
         try {
           const snap = await readUserCacheKey(`online_provider_${p}_user_home_snapshot`);
@@ -656,12 +902,67 @@ export default function activate(folium) {
       }
     }
 
-    // 4. Append local playlists from user_cache
+    // 4. Append Folia 0.8.0 FoliaPlaylistsDB playlists and legacy local_playlists fallback
+    const seenLocalIds = new Set();
     try {
-      const localPlaylists = (await readUserCacheKey('local_playlists')) || [];
+      const foliaPlaylists = await readIndexedDbTable('playlists', 'FoliaPlaylistsDB');
+      if (Array.isArray(foliaPlaylists) && foliaPlaylists.length > 0) {
+        const sorted = [...foliaPlaylists].sort((a, b) => Number(a?.rank ?? 0) - Number(b?.rank ?? 0));
+        const needsLocalCoverLookup = sorted.some(
+          (fp) => !fp?.coverUrl && Array.isArray(fp?.coverLocalSongIds) && fp.coverLocalSongIds.length > 0,
+        );
+        let localSongById = null;
+        if (needsLocalCoverLookup) {
+          const allLocalSongs = await readIndexedDbTable('local_music');
+          localSongById = new Map(allLocalSongs.map((s) => [s.id, s]));
+        }
+
+        for (const fp of sorted) {
+          if (!fp?.id || seenLocalIds.has(fp.id)) continue;
+          seenLocalIds.add(fp.id);
+          let coverUrl = fp.coverUrl || '';
+          if (!coverUrl && localSongById && Array.isArray(fp.coverLocalSongIds)) {
+            for (const songId of fp.coverLocalSongIds) {
+              const songCover = resolveLocalCoverUrl(localSongById.get(songId));
+              if (songCover) {
+                coverUrl = songCover;
+                break;
+              }
+            }
+          }
+          const cacheKey = makeCollectionCacheKey('playlist', 'local', fp.id);
+          cachedCollectionMap.set(cacheKey, {
+            isLocal: true,
+            isFoliaPlaylist: true,
+            rawLocalPlaylist: { ...fp, isFoliaPlaylist: true },
+          });
+          list.push({
+            id: fp.id,
+            cacheKey,
+            name: fp.name || (fp.isFavorite ? '我喜欢的音乐' : '本地歌单'),
+            coverUrl,
+            songCount: typeof fp.entryCount === 'number' ? fp.entryCount : 0,
+            type: 'playlist',
+            isLocal: true,
+            isFoliaPlaylist: true,
+            isLiked: Boolean(fp.isFavorite),
+          });
+        }
+      }
+    } catch {}
+
+    try {
+      // Legacy pre-0.8.0 storage placed local_playlists in KineticPlayerDB api_cache
+      const localPlaylists = (await readCacheKeyFromStores('local_playlists', ['api_cache', 'user_cache'])) || [];
       if (Array.isArray(localPlaylists)) {
         for (const lp of localPlaylists) {
-          const count = Array.isArray(lp.songs) ? lp.songs.length : (Array.isArray(lp.trackIds) ? lp.trackIds.length : 0);
+          if (!lp?.id || seenLocalIds.has(lp.id)) continue;
+          seenLocalIds.add(lp.id);
+          const count = Array.isArray(lp.songIds)
+            ? lp.songIds.length
+            : (Array.isArray(lp.songs)
+              ? lp.songs.length
+              : (Array.isArray(lp.trackIds) ? lp.trackIds.length : 0));
           const cacheKey = makeCollectionCacheKey('playlist', 'local', lp.id);
           cachedCollectionMap.set(cacheKey, { isLocal: true, rawLocalPlaylist: lp });
           list.push({
@@ -684,7 +985,7 @@ export default function activate(folium) {
    * Retrieves all albums combining Omni online saved albums and local albums.
    */
   async function getLibraryAlbums() {
-    const omni = getOmni();
+    const omni = getLegacyInternalOmni();
     const list = [];
     const seenKeys = new Set();
 
@@ -756,7 +1057,7 @@ export default function activate(folium) {
 
     // 3. Fallback: IndexedDB provider snapshot
     if (list.length === 0) {
-      const providers = ['netease', 'kugou', 'qq', 'bodian'];
+      const providers = getKnownSnapshotProviderIds();
       for (const p of providers) {
         try {
           const snap = await readUserCacheKey(`online_provider_${p}_user_home_snapshot`);
@@ -791,10 +1092,9 @@ export default function activate(folium) {
       const allLocalSongs = await readIndexedDbTable('local_music');
       const albumMap = new Map();
       allLocalSongs.forEach((song) => {
-        const albumName = song.importedMetadata?.albumName || song.album?.name || song.album || '未知专辑';
-        const artist = Array.isArray(song.importedMetadata?.artistNames)
-          ? song.importedMetadata.artistNames.join(' / ')
-          : (song.artist || '本地音乐');
+        const meta = formatLocalSongMeta(song);
+        const albumName = meta.albumName || '未知专辑';
+        const artist = meta.artist;
         if (!albumMap.has(albumName)) {
           const albId = `local_album_${albumName}`;
           const cacheKey = makeCollectionCacheKey('album', 'local', albId);
@@ -804,7 +1104,7 @@ export default function activate(folium) {
               cacheKey,
               name: albumName,
               artist,
-              coverUrl: song.onlineMetadata?.coverUrl || '',
+              coverUrl: resolveLocalCoverUrl(song),
               songCount: 0,
               type: 'album',
               isLocal: true,
@@ -829,7 +1129,7 @@ export default function activate(folium) {
    * Retrieves Radio feed: Personal FM, Daily Recommendations, and Recommended Collections.
    */
   async function getLibraryRadioFeed() {
-    const omni = getOmni();
+    const omni = getLegacyInternalOmni();
     let homeFeed = null;
     if (omni?.getHomeFeed) {
       try {
@@ -852,8 +1152,10 @@ export default function activate(folium) {
       };
     });
 
+    const selectedProvider = resolveSelectedProviderId(null);
+
     const recommendedCollections = (homeFeed?.recommendedCollections || []).map((c) => {
-      const pId = c.providerId || (omni?.getActiveProviderSummary?.()?.providerId) || 'netease';
+      const pId = c.providerId || selectedProvider;
       const cacheKey = makeCollectionCacheKey('playlist', pId, c.id);
       cachedCollectionMap.set(cacheKey, { rawCollection: c });
       return {
@@ -884,42 +1186,44 @@ export default function activate(folium) {
    * storing rawSong objects in cachedDetailRawSongs and returning lightweight DTOs.
    */
   async function getLibraryPlaylistSongs(playlistItem, reqId) {
-    const omni = getOmni();
+    const omni = getLegacyInternalOmni();
     const cachedEntry = playlistItem.cacheKey ? cachedCollectionMap.get(playlistItem.cacheKey) : null;
 
-    // 1. Local playlist
+    // 1. Local / Folia aggregated playlist (0.8.0 FoliaPlaylistsDB + legacy local_playlists fallback)
     const rawLocalPlaylist = cachedEntry?.rawLocalPlaylist || playlistItem.rawLocalPlaylist;
-    if (playlistItem.isLocal && rawLocalPlaylist) {
-      const lp = rawLocalPlaylist;
+    if (playlistItem.isLocal && (rawLocalPlaylist || playlistItem.isFoliaPlaylist || cachedEntry?.isFoliaPlaylist)) {
       const allLocalSongs = await readIndexedDbTable('local_music');
+      if (isDisposed || (reqId && reqId !== activePlaylistDetailRequestId)) return [];
       const songMap = new Map(allLocalSongs.map((s) => [s.id, s]));
-      const songIds = Array.isArray(lp.songIds) ? lp.songIds : (Array.isArray(lp.songs) ? lp.songs.map((s) => (typeof s === 'string' ? s : s?.id)) : []);
       const matched = [];
-      songIds.forEach((id) => {
-        const s = songMap.get(id);
-        if (s) {
-          const artist = Array.isArray(s.importedMetadata?.artistNames)
-            ? s.importedMetadata.artistNames.join(' / ')
-            : (s.artist || '本地音乐');
-          matched.push({
-            id: s.id,
-            title: s.title || s.name || '未知曲目',
-            artist,
-            album: s.importedMetadata?.albumName || s.album?.name || '',
-            duration: typeof s.duration === 'number' ? s.duration : 0,
-            rawSong: {
-              id: s.id,
-              name: s.title || s.name || '未知曲目',
-              artists: [{ id: 0, name: artist }],
-              album: { id: 0, name: s.importedMetadata?.albumName || s.album?.name || '' },
-              durationMs: (s.duration || 0) * 1000,
-              isLocal: true,
-              localRef: { songId: s.id },
-              sourceRef: { kind: 'local', mediaId: s.id },
-            },
-          });
+
+      if (playlistItem.isFoliaPlaylist || cachedEntry?.isFoliaPlaylist || rawLocalPlaylist?.isFoliaPlaylist) {
+        const allEntries = await readIndexedDbTable('entries', 'FoliaPlaylistsDB');
+        if (isDisposed || (reqId && reqId !== activePlaylistDetailRequestId)) return [];
+        const playlistEntries = allEntries
+          .filter((entry) => entry && entry.playlistId === playlistItem.id)
+          .sort((a, b) => Number(a.pos ?? 0) - Number(b.pos ?? 0));
+        for (const entry of playlistEntries) {
+          const localId = entry.localSongId || entry.song?.localRef?.songId || (entry.song?.isLocal ? entry.song?.id : null);
+          if (localId && songMap.has(localId)) {
+            matched.push(buildLocalSongEntry(songMap.get(localId)));
+          } else if (entry.song) {
+            matched.push(formatRawSongEntry(entry.song));
+          }
         }
-      });
+      } else if (rawLocalPlaylist) {
+        const lp = rawLocalPlaylist;
+        const songIds = Array.isArray(lp.songIds)
+          ? lp.songIds
+          : (Array.isArray(lp.songs) ? lp.songs.map((s) => (typeof s === 'string' ? s : s?.id)) : []);
+        songIds.forEach((id) => {
+          const s = songMap.get(id);
+          if (s) {
+            matched.push(buildLocalSongEntry(s));
+          }
+        });
+      }
+
       if (!reqId || reqId === activePlaylistDetailRequestId) {
         cachedDetailRawSongs = matched;
       }
@@ -927,7 +1231,7 @@ export default function activate(folium) {
     }
 
     // 2. Online playlist
-    const fallbackProvider = omni?.getActiveProviderSummary?.()?.providerId || 'netease';
+    const fallbackProvider = resolveSelectedProviderId(null);
     const baseCollection = cachedEntry?.rawCollection || playlistItem.rawCollection || {
       id: playlistItem.id,
       providerId: playlistItem.providerId || fallbackProvider,
@@ -942,33 +1246,65 @@ export default function activate(folium) {
     if (omni?.getCollectionTracks) {
       try {
         const allRawSongs = [];
+        const seenTrackKeys = new Set();
         let offset = 0;
         const batchSize = 100;
         let hasMore = true;
         let iteration = 0;
+        let consecutiveEmptyAdds = 0;
         const maxIterations = 50; // support up to 5000 songs
+        let effectiveTotal = Math.max(
+          Number(collection.trackCount) || 0,
+          Number(playlistItem.songCount) || 0,
+        );
+
+        const trackDedupKey = (song) => {
+          if (!song || typeof song !== 'object') return '';
+          const ref = song.sourceRef;
+          if (ref?.kind === 'online') return `online:${ref.providerId || ''}:${ref.mediaId ?? song.id}`;
+          if (ref?.kind) return `${ref.kind}:${ref.mediaId ?? song.id}`;
+          const pId = song.providerId || song.source || collection.providerId || '';
+          return `${pId}:${song.id ?? ''}`;
+        };
 
         while (hasMore && iteration < maxIterations) {
           iteration += 1;
-          const page = await omni.getCollectionTracks(collection, { limit: batchSize, offset });
+          const pageStartOffset = offset;
+          const page = await omni.getCollectionTracks(collection, { limit: batchSize, offset: pageStartOffset });
+          if (isDisposed || (reqId && reqId !== activePlaylistDetailRequestId)) {
+            return allRawSongs.map(toLightSongDto);
+          }
+
           const items = Array.isArray(page?.items) ? page.items : [];
           if (items.length === 0) break;
 
-          for (const song of items) {
-            const artist = Array.isArray(song.artists) ? song.artists.map((a) => a.name).join(' / ') : (song.artist || '未知艺人');
-            const durSec = typeof song.durationMs === 'number' ? Math.round(song.durationMs / 1000) : (song.duration || 0);
-            allRawSongs.push({
-              id: song.id,
-              title: song.name || song.title || '未知曲目',
-              artist,
-              album: song.album?.name || '',
-              duration: durSec,
-              rawSong: song,
-            });
+          const pageTotal = Number(page?.total) || 0;
+          if (pageTotal > effectiveTotal) {
+            effectiveTotal = pageTotal;
           }
 
-          // Push intermediate snapshot after the first batch so user immediately sees first 100 songs
-          if (iteration === 1 && (page?.hasMore !== false && items.length === batchSize)) {
+          let addedThisPage = 0;
+          for (const song of items) {
+            const key = trackDedupKey(song);
+            if (key && seenTrackKeys.has(key)) continue;
+            if (key) seenTrackKeys.add(key);
+            addedThisPage += 1;
+            allRawSongs.push(formatRawSongEntry(song));
+          }
+
+          const nextBucketOffset = (Math.floor(pageStartOffset / batchSize) + 1) * batchSize;
+          const reportedHasMore = typeof page?.hasMore === 'boolean'
+            ? page.hasMore
+            : items.length >= batchSize;
+          // KuGou (count === page size) & NetEase (items.length === limit) report hasMore: false on a
+          // filtered short page (e.g. 99 < 100 on page 2) even when trackCount is much larger.
+          const shouldProbeNextBucket = !reportedHasMore
+            && addedThisPage > 0
+            && effectiveTotal > nextBucketOffset;
+          const pageHasMore = reportedHasMore || shouldProbeNextBucket;
+
+          // Push intermediate snapshot after the first batch so user immediately sees first page
+          if (iteration === 1 && pageHasMore) {
             if (!reqId || reqId === activePlaylistDetailRequestId) {
               cachedDetailRawSongs = [...allRawSongs];
               void pushSnapshot({
@@ -982,14 +1318,21 @@ export default function activate(folium) {
             }
           }
 
-          if (reqId && reqId !== activePlaylistDetailRequestId) {
-            return allRawSongs.map(toLightSongDto);
-          }
-
-          if (page?.hasMore === false || items.length < batchSize) {
+          if (!pageHasMore) {
             hasMore = false;
+          } else if (shouldProbeNextBucket) {
+            consecutiveEmptyAdds = 0;
+            offset = nextBucketOffset;
+          } else if (addedThisPage === 0) {
+            consecutiveEmptyAdds += 1;
+            if (consecutiveEmptyAdds > 1 || nextBucketOffset <= pageStartOffset) break;
+            offset = nextBucketOffset;
           } else {
-            offset = typeof page?.nextOffset === 'number' ? page.nextOffset : offset + items.length;
+            consecutiveEmptyAdds = 0;
+            const nextCandidate = typeof page?.nextOffset === 'number' && page.nextOffset > pageStartOffset
+              ? page.nextOffset
+              : pageStartOffset + items.length;
+            offset = nextCandidate;
           }
         }
 
@@ -1006,38 +1349,108 @@ export default function activate(folium) {
   }
 
   /**
-   * Retrieves songs inside an album (online or local).
+   * Resolves the currently active Omni online provider id using official folium.omni.listProviders()
+   * when available, falling back to legacy host summary.
+   */
+  function resolveSelectedProviderId(preferredId = null) {
+    if (preferredId && typeof preferredId === 'string') return preferredId;
+    if (hasOmniApi && typeof folium.omni?.listProviders === 'function') {
+      try {
+        const selected = folium.omni.listProviders().find((p) => p?.selected);
+        const selectedId = getProviderIdOf(selected);
+        if (selectedId) return selectedId;
+      } catch {}
+    }
+    return getLegacyInternalOmni()?.getActiveProviderSummary?.()?.providerId || 'netease';
+  }
+
+  /**
+   * Retrieves songs inside an album (online via official folium.omni or local).
    */
   async function getLibraryAlbumSongs(albumItem, reqId) {
     const cachedEntry = albumItem.cacheKey ? cachedCollectionMap.get(albumItem.cacheKey) : null;
     const localSongs = cachedEntry?.songs || albumItem.songs;
     if (albumItem.isLocal && Array.isArray(localSongs)) {
-      const mapped = localSongs.map((s) => {
-        const artist = Array.isArray(s.importedMetadata?.artistNames)
-          ? s.importedMetadata.artistNames.join(' / ')
-          : (s.artist || '本地音乐');
-        return {
-          id: s.id,
-          title: s.title || s.name || '未知曲目',
-          artist,
-          album: s.importedMetadata?.albumName || s.album?.name || '',
-          duration: typeof s.duration === 'number' ? s.duration : 0,
-          rawSong: {
-            id: s.id,
-            name: s.title || s.name || '未知曲目',
-            artists: [{ id: 0, name: artist }],
-            album: { id: 0, name: s.importedMetadata?.albumName || s.album?.name || '' },
-            durationMs: (s.duration || 0) * 1000,
-            isLocal: true,
-            localRef: { songId: s.id },
-            sourceRef: { kind: 'local', mediaId: s.id },
-          },
-        };
-      });
+      const mapped = localSongs.map(buildLocalSongEntry);
       if (!reqId || reqId === activePlaylistDetailRequestId) {
         cachedDetailRawSongs = mapped;
       }
       return mapped.map(toLightSongDto);
+    }
+
+    // Online album: use official Folium 1.7+ folium.omni.resolveCollection + getTracks
+    if (hasOmniApi && typeof folium.omni?.resolveCollection === 'function' && typeof folium.omni?.getTracks === 'function') {
+      try {
+        const providerId = resolveSelectedProviderId(albumItem.providerId);
+        const collection = await folium.omni.resolveCollection({
+          source: providerId,
+          kind: 'album',
+          id: String(albumItem.id),
+        });
+        if (isDisposed || (reqId && reqId !== activePlaylistDetailRequestId)) return [];
+        if (collection) {
+          const allRawSongs = [];
+          let cursor = null;
+          let iteration = 0;
+          const maxIterations = 50;
+
+          while (iteration < maxIterations) {
+            iteration += 1;
+            const page = await folium.omni.getTracks(collection, cursor ? { cursor } : { limit: 100 });
+            if (isDisposed || (reqId && reqId !== activePlaylistDetailRequestId)) {
+              return allRawSongs.map(toLightSongDto);
+            }
+            const items = Array.isArray(page?.items) ? page.items : [];
+            if (items.length === 0) break;
+
+            for (const song of items) {
+              let durSec = 0;
+              try {
+                const details = folium.omni.describeSong?.(song);
+                if (typeof details?.durationMs === 'number' && Number.isFinite(details.durationMs)) {
+                  durSec = Math.round(details.durationMs / 1000);
+                }
+              } catch {}
+              allRawSongs.push({
+                id: song.id,
+                title: song.title || '未知曲目',
+                artist: song.artist || '未知艺人',
+                album: song.album || collection.name || albumItem.name || '',
+                duration: durSec,
+                rawSong: song,
+              });
+            }
+
+            if (iteration === 1 && page?.hasMore && page?.nextCursor) {
+              if (!isDisposed && (!reqId || reqId === activePlaylistDetailRequestId)) {
+                cachedDetailRawSongs = [...allRawSongs];
+                void pushSnapshot({
+                  libraryDetailData: {
+                    type: 'album',
+                    id: albumItem.id,
+                    title: albumItem.name,
+                    songs: allRawSongs.map(toLightSongDto),
+                  },
+                });
+              }
+            }
+
+            if (!page?.hasMore || !page?.nextCursor) {
+              break;
+            }
+            cursor = page.nextCursor;
+          }
+
+          if (allRawSongs.length > 0) {
+            if (!reqId || reqId === activePlaylistDetailRequestId) {
+              cachedDetailRawSongs = allRawSongs;
+            }
+            return allRawSongs.map(toLightSongDto);
+          }
+        }
+      } catch (err) {
+        folium.log.warn('folium.omni album read failed, falling back to collection tracks', err);
+      }
     }
 
     return getLibraryPlaylistSongs(albumItem, reqId);
@@ -1052,34 +1465,14 @@ export default function activate(folium) {
     if (query && query.trim()) {
       const q = query.trim().toLowerCase();
       filtered = allLocalSongs.filter((s) => {
-        const title = (s.title || s.name || '').toLowerCase();
-        const artist = (s.importedMetadata?.artistNames?.join(' ') || s.artist || '').toLowerCase();
-        return title.includes(q) || artist.includes(q);
+        const meta = formatLocalSongMeta(s);
+        return meta.title.toLowerCase().includes(q)
+          || meta.artist.toLowerCase().includes(q)
+          || meta.albumName.toLowerCase().includes(q);
       });
     }
     const total = filtered.length;
-    const rawItems = filtered.slice(offset, offset + limit).map((s) => {
-      const artist = Array.isArray(s.importedMetadata?.artistNames)
-        ? s.importedMetadata.artistNames.join(' / ')
-        : (s.artist || '本地音乐');
-      return {
-        id: s.id,
-        title: s.title || s.name || '未知曲目',
-        artist,
-        album: s.importedMetadata?.albumName || s.album?.name || '',
-        duration: typeof s.duration === 'number' ? s.duration : 0,
-        rawSong: {
-          id: s.id,
-          name: s.title || s.name || '未知曲目',
-          artists: [{ id: 0, name: artist }],
-          album: { id: 0, name: s.importedMetadata?.albumName || s.album?.name || '' },
-          durationMs: (s.duration || 0) * 1000,
-          isLocal: true,
-          localRef: { songId: s.id },
-          sourceRef: { kind: 'local', mediaId: s.id },
-        },
-      };
-    });
+    const rawItems = filtered.slice(offset, offset + limit).map(buildLocalSongEntry);
     if (limit > 1) {
       cachedLocalPageRawSongs = rawItems;
     }
@@ -1118,10 +1511,51 @@ export default function activate(folium) {
       const rawSong = matchedEntry?.rawSong || payload.song?.rawSong;
       if (!rawSong) return;
 
+      // 0. Official Folium 1.7+ replaceQueue + playQueueItem for reffed online tracks (e.g. album views)
+      const reffedQueue = sourceList
+        .map((q) => q.rawSong)
+        .filter((s) => s && typeof s.ref === 'string' && s.ref.startsWith('song-'));
+      if (
+        hasReplaceQueueApi
+        && rawSong.ref
+        && reffedQueue.length > 0
+        && reffedQueue.length === sourceList.length
+        && typeof folium.playback?.getQueue === 'function'
+      ) {
+        try {
+          const queueSnap = folium.playback.getQueue({ limit: 1 });
+          const expectedVersion = queueSnap?.version;
+          if (typeof expectedVersion === 'string' && expectedVersion) {
+            const replaceRes = await folium.playback.replaceQueue(reffedQueue, { expectedVersion });
+            if (isDisposed) return;
+            if (replaceRes?.status === 'replaced') {
+              const targetIndex = reffedQueue.findIndex((q) => q === rawSong || String(q.id) === String(songId));
+              if (targetIndex >= 0) {
+                const played = await folium.playback.playQueueItem(targetIndex, reffedQueue[targetIndex].ref);
+                if (isDisposed) return;
+                if (played) {
+                  refreshQueue();
+                  void pushSnapshot({
+                    queue: currentSnapshot.queue,
+                    queueTotal: currentSnapshot.queueTotal,
+                    queuePage: currentSnapshot.queuePage,
+                    currentIndex: currentSnapshot.currentIndex,
+                  });
+                  return;
+                }
+              }
+            }
+          }
+        } catch (err) {
+          folium.log?.warn?.('folium.playback.replaceQueue fell back', err);
+        }
+      }
+
       // 1. Official Folium API: if the song carries a valid session ref, play directly
       if (rawSong.ref && typeof folium.playback?.playSong === 'function') {
         try {
           const played = await folium.playback.playSong(rawSong);
+          if (isDisposed) return;
           if (played) {
             refreshQueue();
             return;
@@ -1137,26 +1571,46 @@ export default function activate(folium) {
         const queueIndex = queueSnapshot.items.findIndex((item) => String(item.song?.id) === String(songId));
         if (queueIndex >= 0) {
           await folium.playback.playQueueItem(queueIndex);
+          if (isDisposed) return;
           refreshQueue();
           return;
         }
       }
 
-      // 3. Fallback for un-reffed local tracks (Folium 1.x runtime store)
-      const pStore = folium['internals']?.stores?.playback;
-      if (!pStore) return;
+      // 3. Transitional fallback for un-reffed local/playlist tracks
+      const pStore = tryGetInternalStores()?.playback;
+      if (!pStore) {
+        // Forward-compatible Folium 2+ fallback: resolve online track key via official folium.omni
+        if (!rawSong.isLocal && hasOmniApi && typeof folium.omni?.resolveSongs === 'function') {
+          const source = rawSong.source || rawSong.providerId || rawSong.sourceRef?.providerId || resolveSelectedProviderId(null);
+          if (source && rawSong.id !== undefined && rawSong.id !== null) {
+            const resolved = await folium.omni.resolveSongs([{ source, id: String(rawSong.id) }]);
+            if (isDisposed) return;
+            const found = Array.isArray(resolved) ? resolved.find((r) => r?.status === 'found' && r.song) : null;
+            if (found?.song) {
+              await folium.playback.playSong(found.song);
+              if (isDisposed) return;
+              refreshQueue();
+            }
+          }
+        }
+        return;
+      }
 
       const rawQueue = sourceList.map((q) => q.rawSong).filter(Boolean);
+      const nextQueue = rawQueue.length > 0 ? rawQueue : [rawSong];
 
-      pStore.getState().setIsFmMode(false);
-      pStore.getState().setPlayQueue(rawQueue.length > 0 ? rawQueue : [rawSong]);
+      applyInternalPlaybackQueue(pStore, nextQueue, false);
 
-      const targetIndex = rawQueue.findIndex((q) => String(q.id) === String(rawSong.id));
+      const targetIndex = nextQueue.findIndex((q) => String(q.id) === String(rawSong.id));
       const safeIndex = targetIndex >= 0 ? targetIndex : 0;
 
-      setTimeout(async () => {
+      const timer = setTimeout(async () => {
+        pendingPlayTimers.delete(timer);
+        if (isDisposed) return;
         try {
           await folium.playback.playQueueItem(safeIndex);
+          if (isDisposed) return;
           refreshQueue();
           void pushSnapshot({
             queue: currentSnapshot.queue,
@@ -1168,6 +1622,7 @@ export default function activate(folium) {
           folium.log.warn('playLibrarySong failed', err);
         }
       }, 60);
+      pendingPlayTimers.add(timer);
     } catch (err) {
       folium.log.warn('playLibrarySong error', err);
     }
@@ -1178,8 +1633,8 @@ export default function activate(folium) {
    */
   async function playPersonalFmMode() {
     try {
-      const omni = getOmni();
-      const pStore = folium['internals']?.stores?.playback;
+      const omni = getLegacyInternalOmni();
+      const pStore = tryGetInternalStores()?.playback;
       if (!omni || !pStore) return;
 
       let tracks = [];
@@ -1188,6 +1643,7 @@ export default function activate(folium) {
       } catch (err) {
         folium.log.warn('getPersonalFm error', err);
       }
+      if (isDisposed) return;
 
       if (!Array.isArray(tracks) || tracks.length === 0) {
         try {
@@ -1195,19 +1651,27 @@ export default function activate(folium) {
           tracks = feed?.personalFm || [];
         } catch {}
       }
+      if (isDisposed) return;
 
       if (Array.isArray(tracks) && tracks.length > 0) {
-        pStore.getState().setIsFmMode(true);
-        pStore.getState().setPlayQueue(tracks);
-        setTimeout(async () => {
-          await folium.playback.playQueueItem(0);
-          refreshQueue();
-          void pushSnapshot({
-            queue: currentSnapshot.queue,
-            queueTotal: currentSnapshot.queueTotal,
-            currentIndex: 0,
-          });
+        applyInternalPlaybackQueue(pStore, tracks, true);
+        const timer = setTimeout(async () => {
+          pendingPlayTimers.delete(timer);
+          if (isDisposed) return;
+          try {
+            await folium.playback.playQueueItem(0);
+            if (isDisposed) return;
+            refreshQueue();
+            void pushSnapshot({
+              queue: currentSnapshot.queue,
+              queueTotal: currentSnapshot.queueTotal,
+              currentIndex: 0,
+            });
+          } catch (err) {
+            folium.log.warn('playPersonalFmMode failed', err);
+          }
         }, 60);
+        pendingPlayTimers.add(timer);
       }
     } catch (err) {
       folium.log.warn('playPersonalFmMode error', err);
@@ -1342,6 +1806,40 @@ export default function activate(folium) {
 
   const settingsAccess = settingsSection?.settings;
 
+  // Register Command Palette & Global Shortcut commands (Folium 1.7+)
+  if (typeof folium.registries?.commands?.register === 'function') {
+    folium.registries.commands.register({
+      id: 'toggle-drawer',
+      label: {
+        'zh-CN': '展开/收起任务栏歌词',
+        en: 'Toggle Taskbar Lyrics',
+      },
+      description: {
+        'zh-CN': '展开或收起 Windows 任务栏歌词',
+        en: 'Expand or collapse the Windows taskbar lyrics',
+      },
+      globalShortcut: true,
+      run: () => {
+        void folium.rpc.call('toggleDrawer');
+      },
+    });
+    folium.registries.commands.register({
+      id: 'switch-display',
+      label: {
+        'zh-CN': '切换任务栏歌词显示器',
+        en: 'Switch Taskbar Lyrics Display',
+      },
+      description: {
+        'zh-CN': '在多台显示器之间切换任务栏歌词位置',
+        en: 'Cycle the active display for the taskbar lyrics',
+      },
+      globalShortcut: true,
+      run: () => {
+        void folium.rpc.call('switchDisplay');
+      },
+    });
+  }
+
   function syncSettings() {
     try {
       if (settingsAccess?.get) {
@@ -1378,8 +1876,9 @@ export default function activate(folium) {
   function resolveEffectiveLyricOffsetMs() {
     try {
       let songOffset = 0;
+      const internalStores = tryGetInternalStores();
       try {
-        const pState = folium['internals']?.stores?.playback?.getState?.();
+        const pState = internalStores?.playback?.getState?.();
         if (pState && typeof pState.lyricTimelineOffsetMs === 'number' && Number.isFinite(pState.lyricTimelineOffsetMs)) {
           songOffset = pState.lyricTimelineOffsetMs;
         }
@@ -1390,7 +1889,7 @@ export default function activate(folium) {
       let globalOffset = 0;
       let hasStoreGlobal = false;
       try {
-        const lState = folium['internals']?.stores?.lyricSettings?.getState?.();
+        const lState = internalStores?.lyricSettings?.getState?.();
         if (lState && typeof lState.globalLyricTimelineOffsetMs === 'number' && Number.isFinite(lState.globalLyricTimelineOffsetMs)) {
           globalOffset = lState.globalLyricTimelineOffsetMs;
           hasStoreGlobal = true;
@@ -1663,27 +2162,52 @@ export default function activate(folium) {
     });
   }));
 
+  // 7b. Playback failed (freeze extrapolation immediately so taskbar clock does not drift on unplayable tracks)
+  if (hasFoliumAtLeast(1, 7)) {
+    try {
+      unsubs.push(folium.events.on('playback.failed', () => {
+        const now = Date.now();
+        currentSnapshot.isAdvancing = false;
+        currentSnapshot.updatedAt = now;
+        void pushSnapshot({
+          playerState: currentSnapshot.playerState,
+          isAdvancing: false,
+          currentTime: currentSnapshot.currentTime,
+          updatedAt: now,
+        });
+      }));
+    } catch {}
+
+    // 7c. Account sign-in settled or changed (refresh cached library summaries/lists loaded during cold start)
+    try {
+      unsubs.push(folium.events.on('account.changed', () => {
+        cachedCollectionMap.clear();
+        if (currentSnapshot.librarySummary) {
+          void handleClientAction({ action: 'fetchLibrarySummary' });
+        }
+        const openCat = currentSnapshot.libraryCategoryData?.category;
+        if (openCat === 'playlists' || openCat === 'albums' || openCat === 'radio') {
+          void handleClientAction({ action: 'fetchLibraryCategory', payload: { category: openCat } });
+        }
+      }));
+    } catch {}
+  }
+
+  function syncPostMountThemeIfNeeded() {
+    if (hasReceivedThemeEvent || !hasThemeCurrentApi) return;
+    const nextTheme = resolveCurrentTheme();
+    if (nextTheme && !sameThemeSnapshot(nextTheme, currentSnapshot.theme)) {
+      currentSnapshot.theme = nextTheme;
+      void pushSnapshot({ theme: nextTheme });
+    }
+  }
+
   // 8. Theme changed (official Folium theme event and theme helpers)
   unsubs.push(folium.events.on('theme.changed', (event) => {
-    let nextTheme = null;
-    if (event && event.theme && typeof event.theme === 'object') {
-      const resolvedFont = typeof folium.theme?.resolveFontStack === 'function'
-        ? folium.theme.resolveFontStack(event.theme)
-        : event.theme.fontFamily;
-      nextTheme = {
-        name: event.theme.name || 'Folia Theme',
-        backgroundColor: event.theme.backgroundColor,
-        primaryColor: event.theme.primaryColor,
-        accentColor: event.theme.accentColor,
-        secondaryColor: event.theme.secondaryColor,
-        fontFamily: resolvedFont || undefined,
-        fontStyle: event.theme.fontStyle,
-        isDaylight: Boolean(event.theme.isDaylight),
-      };
-    }
-    if (!nextTheme) {
-      nextTheme = resolveCurrentTheme();
-    }
+    hasReceivedThemeEvent = true;
+    const nextTheme = (event && event.theme && typeof event.theme === 'object'
+      ? normalizeThemeSnapshot(event.theme)
+      : null) || resolveCurrentTheme();
     cachedLiveTheme = nextTheme;
     currentSnapshot.theme = nextTheme;
     void pushSnapshot({ theme: nextTheme });
@@ -1691,7 +2215,8 @@ export default function activate(folium) {
 
   // 9. Per-song & global lyric timeline offset changes
   try {
-    const pStore = folium['internals']?.stores?.playback;
+    const internalStores = tryGetInternalStores();
+    const pStore = internalStores?.playback;
     if (typeof pStore?.subscribe === 'function') {
       let prevSongOffset = pStore.getState?.()?.lyricTimelineOffsetMs;
       unsubs.push(pStore.subscribe((state) => {
@@ -1707,7 +2232,7 @@ export default function activate(folium) {
       }));
     }
 
-    const lStore = folium['internals']?.stores?.lyricSettings;
+    const lStore = internalStores?.lyricSettings;
     if (typeof lStore?.subscribe === 'function') {
       let prevGlobalOffset = lStore.getState?.()?.globalLyricTimelineOffsetMs;
       unsubs.push(lStore.subscribe((state) => {
@@ -1754,6 +2279,10 @@ export default function activate(folium) {
     theme: currentSnapshot.theme,
     settings: currentSnapshot.settings,
     hasPlaybackControls: currentSnapshot.hasPlaybackControls,
+  }).finally(() => {
+    if (hasRpcPush) {
+      void drainPendingActionsOnce();
+    }
   });
 
   async function handleClientAction(item) {
@@ -1918,8 +2447,11 @@ export default function activate(folium) {
       }
       case 'fetchLibrarySummary': {
         const playlists = await getLibraryPlaylists();
+        if (isDisposed) return;
         const albums = await getLibraryAlbums();
+        if (isDisposed) return;
         const local = await getLibraryLocalSongs(0, 1);
+        if (isDisposed) return;
         void pushSnapshot({
           librarySummary: {
             playlistCount: playlists.length,
@@ -1934,18 +2466,22 @@ export default function activate(folium) {
         const cat = item.payload?.category;
         if (cat === 'playlists') {
           const lists = await getLibraryPlaylists();
+          if (isDisposed) return;
           void pushSnapshot({ libraryCategoryData: { category: 'playlists', items: lists } });
         } else if (cat === 'albums') {
           const albums = await getLibraryAlbums();
+          if (isDisposed) return;
           void pushSnapshot({ libraryCategoryData: { category: 'albums', items: albums } });
         } else if (cat === 'radio') {
           const radioFeed = await getLibraryRadioFeed();
+          if (isDisposed) return;
           void pushSnapshot({ libraryCategoryData: { category: 'radio', radioFeed } });
         } else if (cat === 'local') {
           const page = Number(item.payload?.page) || 0;
           const query = item.payload?.query || '';
           const pageSize = 100;
           const res = await getLibraryLocalSongs(page * pageSize, pageSize, query);
+          if (isDisposed) return;
           void pushSnapshot({
             libraryCategoryData: {
               category: 'local',
@@ -1965,7 +2501,7 @@ export default function activate(folium) {
           activePlaylistDetailRequestId += 1;
           const reqId = activePlaylistDetailRequestId;
           const songs = await getLibraryPlaylistSongs(playlist, reqId);
-          if (reqId === activePlaylistDetailRequestId) {
+          if (!isDisposed && reqId === activePlaylistDetailRequestId) {
             void pushSnapshot({
               libraryDetailData: {
                 type: 'playlist',
@@ -1984,7 +2520,7 @@ export default function activate(folium) {
           activePlaylistDetailRequestId += 1;
           const reqId = activePlaylistDetailRequestId;
           const songs = await getLibraryAlbumSongs(album, reqId);
-          if (reqId === activePlaylistDetailRequestId) {
+          if (!isDisposed && reqId === activePlaylistDetailRequestId) {
             void pushSnapshot({
               libraryDetailData: {
                 type: 'album',
@@ -2010,8 +2546,21 @@ export default function activate(folium) {
     }
   }
 
-  // Subscribe to low-latency RPC push channel for immediate control & seek dispatch
-  if (typeof folium.rpc?.on === 'function') {
+  async function drainPendingActionsOnce() {
+    try {
+      const actions = await folium.rpc.call('drainActions');
+      if (Array.isArray(actions) && actions.length > 0) {
+        for (const item of actions) {
+          await handleClientAction(item);
+        }
+      }
+    } catch {
+      // Ignored
+    }
+  }
+
+  // Subscribe to Folium 1.7+ RPC push channel for immediate control & seek dispatch
+  if (hasRpcPush) {
     const unsubClientAction = folium.rpc.on('clientAction', (item) => {
       void handleClientAction(item);
     });
@@ -2020,14 +2569,19 @@ export default function activate(folium) {
     }
   }
 
-  // Action Dispatcher & Audio Clock Poll Loop (200ms)
+  // Cold-start post-mount theme catch-up (App's first useEffect primes getCurrent() without emitting theme.changed)
+  const postMountThemeTimerA = hasThemeCurrentApi
+    ? setTimeout(() => syncPostMountThemeIfNeeded(), 350)
+    : null;
+  const postMountThemeTimerB = hasThemeCurrentApi
+    ? setTimeout(() => syncPostMountThemeIfNeeded(), 1500)
+    : null;
+
+  // Audio Clock Poll Loop (200ms) + legacy drainActions polling only on pre-1.7 hosts without rpc.on
   const actionPollTimer = setInterval(async () => {
     try {
-      const actions = await folium.rpc.call('drainActions');
-      if (Array.isArray(actions) && actions.length > 0) {
-        for (const item of actions) {
-          await handleClientAction(item);
-        }
+      if (!hasRpcPush) {
+        await drainPendingActionsOnce();
       }
 
       // High-assurance audio synchronization: check playback anchor on each poll cycle
@@ -2039,8 +2593,13 @@ export default function activate(folium) {
 
   // Return Disposer
   return () => {
+    isDisposed = true;
     clearInterval(actionPollTimer);
+    if (postMountThemeTimerA) clearTimeout(postMountThemeTimerA);
+    if (postMountThemeTimerB) clearTimeout(postMountThemeTimerB);
     clearQuickSyncTimers();
+    pendingPlayTimers.forEach((timer) => clearTimeout(timer));
+    pendingPlayTimers.clear();
     cachedCollectionMap.clear();
     cachedDetailRawSongs = [];
     cachedLocalPageRawSongs = [];

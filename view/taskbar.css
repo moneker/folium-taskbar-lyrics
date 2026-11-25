@@ -13,6 +13,15 @@
   --border-subtle: rgba(255, 255, 255, 0.12);
   --border-highlight: rgba(255, 255, 255, 0.22);
   --button-hover-bg: rgba(255, 255, 255, 0.14);
+  --toggle-idle-fg: rgba(248, 250, 252, 0.56);
+  --toggle-hover-fg: #ffffff;
+  --toggle-hover-surface: rgba(255, 255, 255, 0.035);
+  --toggle-hover-border: rgba(255, 255, 255, 0.34);
+  --toggle-rim-highlight: rgba(255, 255, 255, 0.45);
+  --toggle-edge-glow: rgba(129, 140, 248, 0.42);
+  --toggle-edge-inner: rgba(255, 255, 255, 0.16);
+  --toggle-icon-glow: rgba(255, 255, 255, 0.65);
+  --toggle-bar-hover: linear-gradient(180deg, #ffffff 0%, #c7d2fe 55%, #818cf8 100%);
   --taskbar-height: 48px;
   --drawer-easing-in: cubic-bezier(0.16, 1, 0.3, 1);
   --drawer-easing-out: cubic-bezier(0.4, 0, 0.2, 1);
@@ -29,6 +38,15 @@
   --border-subtle: rgba(0, 0, 0, 0.08);
   --border-highlight: rgba(0, 0, 0, 0.18);
   --button-hover-bg: rgba(0, 0, 0, 0.08);
+  --toggle-idle-fg: rgba(24, 24, 27, 0.52);
+  --toggle-hover-fg: #18181b;
+  --toggle-hover-surface: rgba(255, 255, 255, 0.18);
+  --toggle-hover-border: rgba(24, 24, 27, 0.24);
+  --toggle-rim-highlight: rgba(255, 255, 255, 0.8);
+  --toggle-edge-glow: rgba(234, 88, 12, 0.26);
+  --toggle-edge-inner: rgba(255, 255, 255, 0.45);
+  --toggle-icon-glow: rgba(234, 88, 12, 0.42);
+  --toggle-bar-hover: var(--accent-gradient);
 }
 
 * {
@@ -77,6 +95,8 @@ html, body {
 
 /* ======================================================== */
 /* 1. Permanent Left Replacement Button                     */
+/*    Transparent at rest (both collapsed & expanded);      */
+/*    luminous edge + luminous glyph glow on hover/focus.   */
 /* ======================================================== */
 .toggle-button {
   position: absolute;
@@ -86,26 +106,62 @@ html, body {
   width: 44px;
   height: 36px;
   border-radius: 18px;
-  background: var(--bg-acrylic);
-  border: 1px solid var(--border-subtle);
-  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.15);
-  backdrop-filter: blur(24px) saturate(180%);
-  -webkit-backdrop-filter: blur(24px) saturate(180%);
-  color: var(--text-primary);
+  /* Minimum non-zero alpha (1/255) stays 100% visually transparent while preserving Win32 layered hit-testing */
+  background: rgba(255, 255, 255, 0.005);
+  border: 1px solid transparent;
+  box-shadow: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  color: var(--toggle-idle-fg);
   display: flex;
   align-items: center;
   justify-content: center;
   cursor: pointer;
   z-index: 100;
-  transition: all 0.24s cubic-bezier(0.16, 1, 0.3, 1);
+  transition:
+    background-color 0.22s cubic-bezier(0.16, 1, 0.3, 1),
+    border-color 0.22s cubic-bezier(0.16, 1, 0.3, 1),
+    box-shadow 0.24s cubic-bezier(0.16, 1, 0.3, 1),
+    color 0.22s cubic-bezier(0.16, 1, 0.3, 1),
+    transform 0.22s cubic-bezier(0.16, 1, 0.3, 1);
   outline: none;
 }
 
-.toggle-button:hover {
-  background: var(--button-hover-bg);
-  border-color: var(--border-highlight);
-  box-shadow: 0 0 18px var(--accent-glow);
-  transform: translateY(-50%) scale(1.05);
+/* Luminous rim ring revealed only on hover / keyboard focus */
+.toggle-button::before {
+  content: '';
+  position: absolute;
+  inset: -1px;
+  border-radius: inherit;
+  padding: 1px;
+  background: linear-gradient(
+    135deg,
+    var(--toggle-rim-highlight) 0%,
+    var(--toggle-hover-border) 45%,
+    var(--toggle-edge-glow) 100%
+  );
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.toggle-button:hover,
+.toggle-button:focus-visible {
+  background: var(--toggle-hover-surface);
+  border-color: var(--toggle-hover-border);
+  box-shadow:
+    0 0 12px var(--toggle-edge-glow),
+    inset 0 0 8px var(--toggle-edge-inner);
+  color: var(--toggle-hover-fg);
+  transform: translateY(-50%) scale(1.04);
+}
+
+.toggle-button:hover::before,
+.toggle-button:focus-visible::before {
+  opacity: 1;
 }
 
 .toggle-button:active {
@@ -116,6 +172,13 @@ html, body {
   display: flex;
   align-items: center;
   gap: 3px;
+  filter: none;
+  transition: filter 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.toggle-button:hover .toggle-icon-container,
+.toggle-button:focus-visible .toggle-icon-container {
+  filter: drop-shadow(0 0 5px var(--toggle-icon-glow)) drop-shadow(0 0 11px var(--toggle-edge-glow));
 }
 
 /* Equalizer Bars on Toggle Button */
@@ -128,9 +191,17 @@ html, body {
 
 .equalizer-bars .bar {
   width: 2.5px;
-  background: var(--accent-gradient);
+  background: currentColor;
+  opacity: 0.88;
   border-radius: 2px;
-  transition: height 0.2s ease;
+  transition: height 0.2s ease, background 0.22s ease, opacity 0.22s ease, box-shadow 0.22s ease;
+}
+
+.toggle-button:hover .equalizer-bars .bar,
+.toggle-button:focus-visible .equalizer-bars .bar {
+  background: var(--toggle-bar-hover);
+  opacity: 1;
+  box-shadow: 0 0 6px var(--toggle-icon-glow);
 }
 
 .bar-1 { height: 6px; }
@@ -226,8 +297,9 @@ html, body {
   cursor: pointer;
 }
 
-.app-root.vertical-taskbar .toggle-button:hover {
-  transform: translateX(-50%) scale(1.05);
+.app-root.vertical-taskbar .toggle-button:hover,
+.app-root.vertical-taskbar .toggle-button:focus-visible {
+  transform: translateX(-50%) scale(1.04);
 }
 
 .app-root.vertical-taskbar .toggle-button:active {
@@ -703,6 +775,7 @@ html, body {
 }
 
 .lyric-sub {
+  font-family: var(--app-sub-font-family, var(--app-font-family, inherit));
   font-size: 11.5px;
   font-weight: 400;
   color: rgba(248, 250, 252, 0.55);

@@ -29,15 +29,52 @@ const SHELL_WINDOW_CLASSES = new Set([
 ]);
 
 let win32Inspector = null;
+let koffiLoadWarned = false;
 
-function getWin32Inspector() {
+function loadKoffiModule() {
+  try {
+    return require('koffi');
+  } catch {}
+  try {
+    if (require.main && typeof require.main.require === 'function') {
+      return require.main.require('koffi');
+    }
+  } catch {}
+  const candidates = [];
+  if (typeof process.resourcesPath === 'string' && process.resourcesPath) {
+    candidates.push(path.join(process.resourcesPath, 'app.asar', 'node_modules', 'koffi'));
+    candidates.push(path.join(process.resourcesPath, 'app.asar.unpacked', 'node_modules', 'koffi'));
+  }
+  if (app && typeof app.getAppPath === 'function') {
+    try {
+      const appPath = app.getAppPath();
+      if (appPath) candidates.push(path.join(appPath, 'node_modules', 'koffi'));
+    } catch {}
+  }
+  for (const candidate of candidates) {
+    try {
+      return require(candidate);
+    } catch {}
+  }
+  return null;
+}
+
+function getWin32Inspector(log) {
   if (win32Inspector !== null) return win32Inspector;
   if (process.platform !== 'win32') {
     win32Inspector = false;
     return false;
   }
   try {
-    const koffi = require('koffi');
+    const koffi = loadKoffiModule();
+    if (!koffi) {
+      if (!koffiLoadWarned) {
+        koffiLoadWarned = true;
+        log?.warn?.('[taskbar-lyrics] Could not resolve native module "koffi"; Win32 taskbar positioning falls back to Electron bounds.');
+      }
+      win32Inspector = false;
+      return false;
+    }
     const user32 = koffi.load('user32.dll');
     const RectStruct = koffi.struct({
       left: 'long',
@@ -114,9 +151,27 @@ const MENU_SNAPSHOT_KEYS = [
   'hasPlaybackControls',
 ];
 
+function normalizeRuntimeTheme(theme) {
+  if (!theme || typeof theme !== 'object') return null;
+  const resolvedFont = theme.fontFamily
+    || (Array.isArray(theme.fontFamilyStack) && theme.fontFamilyStack.length > 0
+      ? theme.fontFamilyStack.join(', ')
+      : undefined);
+  return {
+    name: theme.name || 'Folia Theme',
+    backgroundColor: theme.backgroundColor,
+    primaryColor: theme.primaryColor,
+    accentColor: theme.accentColor,
+    secondaryColor: theme.secondaryColor,
+    fontFamily: resolvedFont,
+    fontStyle: theme.fontStyle || 'sans',
+    isDaylight: Boolean(theme.isDaylight),
+  };
+}
+
 /**
  * Taskbar Lyrics Mod Main Entry
- * @param {import('../../src/mods/folium/contract').FoliumNodeApi} api
+ * @param {import('../folium').FoliumMainApi} api
  */
 module.exports = function activate(api) {
   // Enforce Windows platform limitation
@@ -125,8 +180,10 @@ module.exports = function activate(api) {
     return () => {};
   }
 
-  api.log.info(`Activating Taskbar Lyrics Drawer mod (v${api.manifest.version})`);
+  api.log.info(`Activating Taskbar Lyrics mod (v${api.manifest.version})`);
 
+  let isDisposed = false;
+  let startupWindowTimer = null;
   let taskbarWindow = null;
   let menuWindow = null;
   let isEnabled = true;
@@ -142,6 +199,11 @@ module.exports = function activate(api) {
   let collapseTimer = null;
   let hoverWatchTimer = null;
   let menuDestroyTimer = null;
+  let hostCloseCheckTimer = null;
+  let isCreatingOwnedWindow = false;
+  const topmostRetryTimers = new Set();
+  const pendingWindowInspectTimers = new Set();
+  const watchedHostWindows = new Map();
   let lastMenuBlurTime = 0;
 
   function dispatchClientAction(actionObj) {
@@ -465,6 +527,7 @@ module.exports = function activate(api) {
     if (api.runtime && typeof api.runtime.getPlaybackSnapshot === 'function') {
       const snap = api.runtime.getPlaybackSnapshot();
       if (snap) {
+        const initialTheme = normalizeRuntimeTheme(snap.theme);
         latestTaskbarSnapshot = {
           ...latestTaskbarSnapshot,
           song: snap.song ? {
@@ -475,14 +538,17 @@ module.exports = function activate(api) {
           playerState: snap.state || 'paused',
           currentTime: typeof snap.position === 'number' ? snap.position : 0,
           duration: typeof snap.duration === 'number' ? snap.duration : 0,
-          theme: snap.theme || null,
+          theme: initialTheme,
           updatedAt: Date.now(),
           lyrics: Array.isArray(snap.lines) && snap.lines.length > 0 ? {
             lines: snap.lines.map((line) => ({
               startTime: line.startTime,
               endTime: line.endTime,
+              ...(typeof line.renderHints?.renderEndTime === 'number'
+                ? { renderEndTime: line.renderHints.renderEndTime }
+                : {}),
               fullText: line.fullText || line.text || '',
-              text: line.text || '',
+              text: line.fullText || line.text || '',
               translation: line.translation || '',
               words: Array.isArray(line.words) ? line.words.map((w) => ({
                 text: w.text,
@@ -497,7 +563,7 @@ module.exports = function activate(api) {
           volume: typeof snap.volume === 'number' ? Math.round(snap.volume * 100) : 100,
           isMuted: Boolean(snap.muted),
           loopMode: snap.loopMode || 'all',
-          theme: snap.theme || null,
+          theme: initialTheme,
         };
       }
     }
@@ -635,16 +701,20 @@ module.exports = function activate(api) {
         } catch {}
       }
       assertTopmost(true);
-      setTimeout(() => {
-        if (!isFullscreenHidden && !isHoverHidden) {
+      const retryShort = setTimeout(() => {
+        topmostRetryTimers.delete(retryShort);
+        if (!isDisposed && !isFullscreenHidden && !isHoverHidden) {
           assertTopmost(true);
         }
       }, 150);
-      setTimeout(() => {
-        if (!isFullscreenHidden && !isHoverHidden) {
+      topmostRetryTimers.add(retryShort);
+      const retryLong = setTimeout(() => {
+        topmostRetryTimers.delete(retryLong);
+        if (!isDisposed && !isFullscreenHidden && !isHoverHidden) {
           assertTopmost(true);
         }
       }, 450);
+      topmostRetryTimers.add(retryLong);
     }
     return false;
   }
@@ -978,29 +1048,36 @@ module.exports = function activate(api) {
     }
 
     const bounds = resolveMenuBounds();
-    const win = new BrowserWindow({
-      x: bounds.x,
-      y: bounds.y,
-      width: bounds.width,
-      height: bounds.height,
-      frame: false,
-      transparent: true,
-      hasShadow: false,
-      backgroundColor: '#00000000',
-      title: 'Folia Taskbar Menu',
-      autoHideMenuBar: true,
-      resizable: false,
-      movable: false,
-      show: false,
-      alwaysOnTop: true,
-      skipTaskbar: true,
-      webPreferences: {
-        preload: path.join(__dirname, 'view', 'preload.cjs'),
-        nodeIntegration: false,
-        contextIsolation: true,
-        backgroundThrottling: true,
-      },
-    });
+    isCreatingOwnedWindow = true;
+    let win;
+    try {
+      win = new BrowserWindow({
+        x: bounds.x,
+        y: bounds.y,
+        width: bounds.width,
+        height: bounds.height,
+        frame: false,
+        transparent: true,
+        hasShadow: false,
+        backgroundColor: '#00000000',
+        title: 'Folia Taskbar Menu',
+        autoHideMenuBar: true,
+        resizable: false,
+        movable: false,
+        show: false,
+        alwaysOnTop: true,
+        skipTaskbar: true,
+        webPreferences: {
+          preload: path.join(__dirname, 'view', 'preload.cjs'),
+          nodeIntegration: false,
+          contextIsolation: true,
+          backgroundThrottling: true,
+        },
+      });
+      win.__foliaTaskbarLyricsOwned = true;
+    } finally {
+      isCreatingOwnedWindow = false;
+    }
 
     win.setAlwaysOnTop(true, 'screen-saver');
     if (typeof win.setVisibleOnAllWorkspaces === 'function') {
@@ -1127,6 +1204,9 @@ module.exports = function activate(api) {
   }
 
   function toggleDrawer() {
+    if ((!taskbarWindow || taskbarWindow.isDestroyed()) && isEnabled && !isDisposed) {
+      createWindow();
+    }
     if (isDrawerExpanded) {
       collapseDrawer();
     } else {
@@ -1140,32 +1220,39 @@ module.exports = function activate(api) {
     }
 
     const winBounds = resolveDrawerWindowBounds(isDrawerExpanded);
-    const win = new BrowserWindow({
-      x: winBounds.x,
-      y: winBounds.y,
-      width: winBounds.width,
-      height: winBounds.height,
-      minWidth: 1,
-      minHeight: 1,
-      frame: false,
-      transparent: true,
-      hasShadow: false,
-      backgroundColor: '#00000000',
-      title: 'Folia Taskbar Lyrics Drawer',
-      autoHideMenuBar: true,
-      resizable: false,
-      movable: false,
-      focusable: true,
-      show: false,
-      alwaysOnTop: true,
-      skipTaskbar: true,
-      webPreferences: {
-        preload: path.join(__dirname, 'view', 'preload.cjs'),
-        nodeIntegration: false,
-        contextIsolation: true,
-        backgroundThrottling: false,
-      },
-    });
+    isCreatingOwnedWindow = true;
+    let win;
+    try {
+      win = new BrowserWindow({
+        x: winBounds.x,
+        y: winBounds.y,
+        width: winBounds.width,
+        height: winBounds.height,
+        minWidth: 1,
+        minHeight: 1,
+        frame: false,
+        transparent: true,
+        hasShadow: false,
+        backgroundColor: '#00000000',
+        title: 'Folia Taskbar Lyrics',
+        autoHideMenuBar: true,
+        resizable: false,
+        movable: false,
+        focusable: true,
+        show: false,
+        alwaysOnTop: true,
+        skipTaskbar: true,
+        webPreferences: {
+          preload: path.join(__dirname, 'view', 'preload.cjs'),
+          nodeIntegration: false,
+          contextIsolation: true,
+          backgroundThrottling: false,
+        },
+      });
+      win.__foliaTaskbarLyricsOwned = true;
+    } finally {
+      isCreatingOwnedWindow = false;
+    }
 
     win.setAlwaysOnTop(true, 'screen-saver');
     if (typeof win.setVisibleOnAllWorkspaces === 'function') {
@@ -1403,8 +1490,150 @@ module.exports = function activate(api) {
     displayInfo: buildDisplayInfo(),
   }));
 
-  // Initialize the taskbar window
-  createWindow();
+  // Seed Win32 inspector with mod logger so missing koffi is reported once
+  getWin32Inspector(api.log);
+
+  let sawTaggedMainWindow = false;
+
+  function noteWindowTag(win) {
+    if (win && typeof win.__wallpaperGeometry === 'boolean') {
+      sawTaggedMainWindow = true;
+    }
+  }
+
+  function isHostBrowserWindow(win) {
+    if (
+      !win
+      || typeof win.isDestroyed !== 'function'
+      || win.isDestroyed()
+      || win === taskbarWindow
+      || win === menuWindow
+      || win.__foliaTaskbarLyricsOwned
+    ) {
+      return false;
+    }
+    noteWindowTag(win);
+    if (sawTaggedMainWindow) {
+      return typeof win.__wallpaperGeometry === 'boolean';
+    }
+    return true;
+  }
+
+  function hasHostBrowserWindow() {
+    try {
+      return BrowserWindow.getAllWindows().some(isHostBrowserWindow);
+    } catch {
+      return false;
+    }
+  }
+
+  function clearOwnedTimers() {
+    if (collapseTimer) {
+      clearTimeout(collapseTimer);
+      collapseTimer = null;
+    }
+    if (hoverWatchTimer) {
+      clearInterval(hoverWatchTimer);
+      hoverWatchTimer = null;
+    }
+    if (hostCloseCheckTimer) {
+      clearTimeout(hostCloseCheckTimer);
+      hostCloseCheckTimer = null;
+    }
+    pendingWindowInspectTimers.forEach((timer) => clearImmediate(timer));
+    pendingWindowInspectTimers.clear();
+    topmostRetryTimers.forEach((timer) => clearTimeout(timer));
+    topmostRetryTimers.clear();
+    clearMenuDestroyTimer();
+  }
+
+  function closeOwnedWindows() {
+    clearOwnedTimers();
+    isDrawerExpanded = false;
+    isHoverHidden = false;
+    isFullscreenHidden = false;
+    if (menuWindow && !menuWindow.isDestroyed()) {
+      menuWindow.close();
+      menuWindow = null;
+    }
+    if (taskbarWindow && !taskbarWindow.isDestroyed()) {
+      taskbarWindow.close();
+      taskbarWindow = null;
+    }
+  }
+
+  function scheduleHostCloseCheck() {
+    if (hostCloseCheckTimer) {
+      clearTimeout(hostCloseCheckTimer);
+    }
+    hostCloseCheckTimer = setTimeout(() => {
+      hostCloseCheckTimer = null;
+      if (!isDisposed && !hasHostBrowserWindow()) {
+        // Closing our top-level BrowserWindows unblocks Electron window-all-closed so Folia exits cleanly
+        closeOwnedWindows();
+      }
+    }, 250);
+  }
+
+  function watchHostWindow(win) {
+    if (!isHostBrowserWindow(win) || watchedHostWindows.has(win) || typeof win.on !== 'function') {
+      return;
+    }
+    const onHostClosed = () => {
+      watchedHostWindows.delete(win);
+      if (!isDisposed) {
+        scheduleHostCloseCheck();
+      }
+    };
+    watchedHostWindows.set(win, onHostClosed);
+    if (typeof win.once === 'function') {
+      win.once('closed', onHostClosed);
+    } else {
+      win.on('closed', onHostClosed);
+    }
+  }
+
+  try {
+    const initialWindows = BrowserWindow.getAllWindows();
+    initialWindows.forEach(noteWindowTag);
+    initialWindows.forEach(watchHostWindow);
+  } catch {}
+
+  const onBrowserWindowCreated = (_event, win) => {
+    if (isDisposed || isCreatingOwnedWindow || win?.__foliaTaskbarLyricsOwned) return;
+    // Defer to setImmediate so electron/main.cjs finishes tagging win.__wallpaperGeometry right after
+    // `new BrowserWindow(...)` returns, and non-host windows never cancel hostCloseCheckTimer.
+    const timer = setImmediate(() => {
+      pendingWindowInspectTimers.delete(timer);
+      if (isDisposed || !isHostBrowserWindow(win)) return;
+      watchHostWindow(win);
+      if (hostCloseCheckTimer) {
+        clearTimeout(hostCloseCheckTimer);
+        hostCloseCheckTimer = null;
+      }
+      if (isEnabled && (!taskbarWindow || taskbarWindow.isDestroyed())) {
+        createWindow();
+      }
+    });
+    pendingWindowInspectTimers.add(timer);
+  };
+
+  const onAppBeforeQuit = () => {
+    closeOwnedWindows();
+  };
+
+  if (app && typeof app.on === 'function') {
+    app.on('browser-window-created', onBrowserWindowCreated);
+    app.on('before-quit', onAppBeforeQuit);
+  }
+
+  // Defer BrowserWindow + native Win32 setup past synchronous activate() so main call cost stays < 100ms
+  startupWindowTimer = setImmediate(() => {
+    startupWindowTimer = null;
+    if (!isDisposed && (!taskbarWindow || taskbarWindow.isDestroyed())) {
+      createWindow();
+    }
+  });
 
   // Active Z-order & fullscreen avoidance watchdog for Windows
   const topmostKeepAliveTimer = setInterval(() => {
@@ -1432,11 +1661,26 @@ module.exports = function activate(api) {
 
   // Lifecycle teardown
   const onDispose = () => {
-    api.log.info('Deactivating Taskbar Lyrics Drawer mod');
+    if (isDisposed) return;
+    isDisposed = true;
+    api.log.info('Deactivating Taskbar Lyrics mod');
+    if (startupWindowTimer) {
+      clearImmediate(startupWindowTimer);
+      startupWindowTimer = null;
+    }
     if (topmostKeepAliveTimer) clearInterval(topmostKeepAliveTimer);
-    if (collapseTimer) clearTimeout(collapseTimer);
-    if (hoverWatchTimer) clearInterval(hoverWatchTimer);
-    clearMenuDestroyTimer();
+
+    watchedHostWindows.forEach((handler, win) => {
+      try {
+        win.removeListener?.('closed', handler);
+      } catch {}
+    });
+    watchedHostWindows.clear();
+
+    if (app && typeof app.removeListener === 'function') {
+      app.removeListener('browser-window-created', onBrowserWindowCreated);
+      app.removeListener('before-quit', onAppBeforeQuit);
+    }
 
     screen.removeListener('display-metrics-changed', onDisplayChanged);
     screen.removeListener('display-added', onDisplayChanged);
@@ -1454,15 +1698,7 @@ module.exports = function activate(api) {
     ipcMain.removeListener('taskbar-lyrics:switch-display', onSwitchDisplay);
     ipcMain.removeListener('taskbar-lyrics:move-vertical', onMoveVertical);
 
-    if (menuWindow && !menuWindow.isDestroyed()) {
-      menuWindow.close();
-      menuWindow = null;
-    }
-
-    if (taskbarWindow && !taskbarWindow.isDestroyed()) {
-      taskbarWindow.close();
-      taskbarWindow = null;
-    }
+    closeOwnedWindows();
   };
 
   return onDispose;
