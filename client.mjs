@@ -212,6 +212,7 @@ export default function activate(folium) {
     libraryDetailData: null,
     settings: {
       interactionMode: 'standard',
+      rightFadeDelaySec: 1.5,
       targetDisplay: 'primary',
       showLyrics: true,
       showTranslation: true,
@@ -2404,6 +2405,22 @@ export default function activate(folium) {
         ],
       },
       {
+        key: 'rightFadeDelaySec',
+        type: 'number',
+        label: {
+          'zh-CN': '悬停隐藏右侧缓冲时间（秒）',
+          en: 'Hover-Hide Right Controls Buffer (s)',
+        },
+        description: {
+          'zh-CN': '悬停隐藏模式下，鼠标移入右侧控制区后的缓慢渐隐缓冲时长（默认 1.5 秒，设为 0 则立即隐藏）',
+          en: 'Slow fade-out buffer duration when hovering the right controls in hover-hide mode (default 1.5s; 0 hides immediately)',
+        },
+        defaultValue: 1.5,
+        min: 0,
+        max: 6,
+        step: 0.1,
+      },
+      {
         key: 'targetDisplay',
         type: 'select',
         label: {
@@ -2576,12 +2593,17 @@ export default function activate(folium) {
         const showTr = values?.showTranslation;
         const useBg = values?.useCoverBackground;
         const mode = values?.interactionMode === 'hover-hide' ? 'hover-hide' : 'standard';
+        const rawFadeSec = Number(values?.rightFadeDelaySec);
+        const rightFadeDelaySec = Number.isFinite(rawFadeSec)
+          ? Math.round(Math.max(0, Math.min(6, rawFadeSec)) * 10) / 10
+          : 1.5;
         const display = typeof values?.targetDisplay === 'string' && values.targetDisplay
           ? values.targetDisplay
           : 'primary';
         const resolvedShowLyrics = typeof showLyrics === 'boolean' ? showLyrics : true;
         currentSnapshot.settings = {
           interactionMode: mode,
+          rightFadeDelaySec,
           targetDisplay: display,
           showLyrics: resolvedShowLyrics,
           showTranslation: typeof showTr === 'boolean' ? showTr : true,

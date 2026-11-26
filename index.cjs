@@ -534,6 +534,7 @@ module.exports = function activate(api) {
       showTranslation: true,
       useCoverBackground: true,
       interactionMode: 'standard',
+      rightFadeDelaySec: 1.5,
       targetDisplay: 'primary',
     },
     displayInfo: buildDisplayInfo(),

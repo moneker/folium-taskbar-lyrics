@@ -83,6 +83,7 @@
     lyricOffsetMs: 0,
     settings: {
       interactionMode: 'standard',
+      rightFadeDelaySec: 1.5,
       targetDisplay: 'primary',
       showLyrics: true,
       showTranslation: true,
@@ -445,11 +446,29 @@
     }
   }
 
+  function resolveRightFadeDelayMs() {
+    const raw = Number(snapshot.settings?.rightFadeDelaySec);
+    if (!Number.isFinite(raw)) return RIGHT_FADE_BUFFER_MS;
+    const clampedSec = Math.max(0, Math.min(6, raw));
+    return Math.round(clampedSec * 1000);
+  }
+
   function startRightFadeBuffer() {
     if (snapshot.settings?.interactionMode !== 'hover-hide' || isHoverHidden) return;
     if (hoverZonePhase !== 'idle' || isRadialOpen || isMenuOpen || isDraggingProgress) return;
+    const delayMs = resolveRightFadeDelayMs();
+    if (delayMs <= 0) {
+      clearRightRecoverTimer();
+      appRoot.classList.remove('hover-recovering-right', 'hover-fading-right');
+      cancelLikeWheelHover();
+      if (typeof bridge.notifyHoverEnter === 'function') {
+        bridge.notifyHoverEnter();
+      }
+      return;
+    }
     clearRightRecoverTimer();
     appRoot.classList.remove('hover-recovering-right');
+    appRoot.style.setProperty('--right-fade-duration', `${(delayMs / 1000).toFixed(2)}s`);
     hoverZonePhase = 'right-fading';
     appRoot.classList.add('hover-fading-right');
     if (typeof bridge.notifyHoverZoneState === 'function') {
@@ -473,7 +492,7 @@
           bridge.notifyHoverEnter();
         }
       }
-    }, RIGHT_FADE_BUFFER_MS);
+    }, delayMs);
   }
 
   function handleHoverMoveInMode(e, isEnter = false) {

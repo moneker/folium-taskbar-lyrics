@@ -77,10 +77,10 @@ html, body {
   transition: opacity 0.18s ease;
 }
 
-/* Hover-hide right-zone slow fade buffer: gives user ~1.5s to interact with right controls before passing through */
+/* Hover-hide right-zone slow fade buffer: user-configurable duration (default 1.5s) before passing through */
 .app-root.hover-fading-right {
   opacity: 0.14;
-  transition: opacity 1.5s linear;
+  transition: opacity var(--right-fade-duration, 1.5s) linear;
 }
 
 /* Smooth recovery when user clicks/interacts during right-zone fade buffer */
