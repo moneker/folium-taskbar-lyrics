@@ -30,6 +30,9 @@
   const volumeMuteIcon = document.getElementById('volumeMuteIcon');
   const volumeSlider = document.getElementById('volumeSlider');
   const volumePercent = document.getElementById('volumePercent');
+  const offsetMinusBtn = document.getElementById('offsetMinusBtn');
+  const offsetResetBtn = document.getElementById('offsetResetBtn');
+  const offsetPlusBtn = document.getElementById('offsetPlusBtn');
 
   let activeTab = 'queue'; // 'queue' | 'search' | 'explore' | 'saved'
   let savedSubTab = 'saved'; // 'saved' | 'recent'
@@ -52,6 +55,9 @@
     loopMode: 'all',
     volume: 100,
     isMuted: false,
+    lyricOffsetMs: 0,
+    songLyricOffsetMs: 0,
+    globalLyricOffsetMs: 0,
   };
 
   let currentSong = null;
@@ -1096,6 +1102,60 @@
     });
   }
 
+  function formatOffsetMs(ms) {
+    const val = Math.round(Number(ms) || 0);
+    if (val === 0) return '0ms';
+    return val > 0 ? `+${val}ms` : `${val}ms`;
+  }
+
+  function updateOffsetControls() {
+    const hasSong = Boolean(currentSong && (currentSong.id || currentSong.title));
+    const songMs = Math.round(Number(footerState.songLyricOffsetMs) || 0);
+    const globalMs = Math.round(Number(footerState.globalLyricOffsetMs) || 0);
+    const totalMs = Math.round(Number(footerState.lyricOffsetMs) || (songMs + globalMs));
+
+    if (offsetMinusBtn) offsetMinusBtn.disabled = !hasSong;
+    if (offsetPlusBtn) offsetPlusBtn.disabled = !hasSong;
+    if (offsetResetBtn) {
+      offsetResetBtn.disabled = !hasSong || songMs === 0;
+      offsetResetBtn.classList.toggle('has-offset', totalMs !== 0);
+      if (globalMs !== 0 && songMs !== 0) {
+        offsetResetBtn.textContent = `${formatOffsetMs(songMs)} (总${formatOffsetMs(totalMs)})`;
+      } else if (globalMs !== 0) {
+        offsetResetBtn.textContent = `总${formatOffsetMs(totalMs)}`;
+      } else {
+        offsetResetBtn.textContent = formatOffsetMs(songMs);
+      }
+      offsetResetBtn.title = !hasSong
+        ? '当前无播放曲目'
+        : `单曲 ${formatOffsetMs(songMs)} + 全局 ${formatOffsetMs(globalMs)} = 总计 ${formatOffsetMs(totalMs)}${songMs !== 0 ? '（点击重置当前曲目偏移）' : ''}`;
+    }
+  }
+
+  if (offsetMinusBtn) {
+    offsetMinusBtn.addEventListener('click', () => {
+      if (!offsetMinusBtn.disabled) {
+        bridge.sendPlaybackAction('adjustSongLyricOffset', -200);
+      }
+    });
+  }
+
+  if (offsetPlusBtn) {
+    offsetPlusBtn.addEventListener('click', () => {
+      if (!offsetPlusBtn.disabled) {
+        bridge.sendPlaybackAction('adjustSongLyricOffset', 200);
+      }
+    });
+  }
+
+  if (offsetResetBtn) {
+    offsetResetBtn.addEventListener('click', () => {
+      if (!offsetResetBtn.disabled) {
+        bridge.sendPlaybackAction('resetSongLyricOffset');
+      }
+    });
+  }
+
   if (muteBtn) {
     muteBtn.addEventListener('click', () => {
       bridge.sendPlaybackAction('toggleMute');
@@ -1173,6 +1233,7 @@
       const prevKey = portableKey(currentSong?.source, currentSong?.id);
       const nextKey = portableKey(data.song?.source, data.song?.id);
       currentSong = data.song;
+      updateOffsetControls();
       if (activeTab === 'saved') shouldRender = true;
       if (activeTab === 'explore' && prevKey !== nextKey && (!exploreData || exploreData.view === 'overview')) {
         bridge.sendPlaybackAction('fetchExplore', { kind: 'overview' });
@@ -1228,10 +1289,30 @@
       updateVolume(footerState.volume, footerState.isMuted);
     }
 
+    if (
+      data.lyricOffsetMs !== undefined
+      || data.songLyricOffsetMs !== undefined
+      || data.globalLyricOffsetMs !== undefined
+    ) {
+      if (typeof data.songLyricOffsetMs === 'number' && Number.isFinite(data.songLyricOffsetMs)) {
+        footerState.songLyricOffsetMs = data.songLyricOffsetMs;
+      }
+      if (typeof data.globalLyricOffsetMs === 'number' && Number.isFinite(data.globalLyricOffsetMs)) {
+        footerState.globalLyricOffsetMs = data.globalLyricOffsetMs;
+      }
+      if (typeof data.lyricOffsetMs === 'number' && Number.isFinite(data.lyricOffsetMs)) {
+        footerState.lyricOffsetMs = data.lyricOffsetMs;
+      } else {
+        footerState.lyricOffsetMs = footerState.songLyricOffsetMs + footerState.globalLyricOffsetMs;
+      }
+      updateOffsetControls();
+    }
+
     if (shouldRender) {
       renderActiveTab();
     }
   });
 
+  updateOffsetControls();
   renderActiveTab();
 })();

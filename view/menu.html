@@ -77,6 +77,22 @@
         </button>
       </div>
 
+      <!-- Lyric Timeline Offset Row (Mod-owned per-song adjustment + global setting sum) -->
+      <div class="offset-row">
+        <span class="offset-title" title="任务栏歌词独立时间轴偏移（正数让歌词更晚出现，全局偏移可在模组设置中调整）">
+          <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="9"></circle>
+            <polyline points="12 7 12 12 15.5 14"></polyline>
+          </svg>
+          <span>歌词偏移</span>
+        </span>
+        <div class="offset-controls">
+          <button id="offsetMinusBtn" class="offset-step-btn" type="button" title="当前曲目歌词提前 200ms">-0.2s</button>
+          <button id="offsetResetBtn" class="offset-value-btn" type="button" title="点击重置当前曲目偏移">0ms</button>
+          <button id="offsetPlusBtn" class="offset-step-btn" type="button" title="当前曲目歌词延后 200ms">+0.2s</button>
+        </div>
+      </div>
+
       <!-- Volume Slider -->
       <div class="volume-row">
         <button id="muteBtn" class="volume-icon-btn" type="button" title="静音切换">

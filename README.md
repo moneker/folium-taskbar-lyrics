@@ -17,7 +17,7 @@
   - **鼠标悬停自动隐藏（Hover 隐藏）**：可在模组设置中开启，鼠标移入任务栏区域时歌词抽屉自动隐藏并穿透点击到底层原生 Windows 任务栏，鼠标移出任务栏后自动恢复显示。
 - **多显示器切换、竖排任务栏与纯 Electron 置顶守护**：支持在主显示器、副显示器、指定编号显示器之间切换，快捷控制菜单底部支持一键切屏；完全采用 Electron 原生 `screen` 与 `BrowserWindow` 接口（`screen-saver` 层级 + 失焦短延迟重提）完成任务栏定位、置顶保活与 Folia 全屏窗口避让，不借用任何宿主私有原生模块。
 - **高保真流体封面背景与任务栏红心**：深度复刻 Folia 官方歌词舞台质感，通过 `folium.omni.describeSong()` 同步读取当前曲目封面并实时生成高斯模糊流体亚克力背景；控制区内置同步宿主的红心点赞按钮（`folium.playback.toggleLike()`）。
-- **逐字平滑卡拉OK过渡与后台防抖**：支持 TTML / 逐字时间戳双行歌词（原文 + 翻译）与 `FoliumLine.renderHints.renderEndTime` 行尾保持提示，内置单调时间推进保护，即使 Folia 最小化在后台或系统高负载下，歌词与逐字扫光依然丝滑推进、不回弹抽动。
+- **逐字平滑卡拉OK过渡、时间轴偏移微调与后台防抖**：支持 TTML / 逐字时间戳双行歌词（原文 + 翻译）与 `FoliumLine.renderHints.renderEndTime` 行尾保持提示；支持在模组设置中配置全局歌词偏移（ms，补偿蓝牙等输出延迟）并在弹窗底部按单曲快捷微调 `±200ms`（自动记住单曲偏移并与全局偏移叠加）；内置单调时间推进与缓冲冻结保护，即使 Folia 最小化在后台、长时间暂停恢复或网络加载中，进度条与逐字扫光依然精准同步。
 - **四标签快捷控制面板（100% 公开接口）**：
   - **队列**：分页查看当前播放队列（每页 50 首），支持一键定位正在播放曲目、单击点播（带 `expectedRef` 校验）、行内快速收藏与一键打乱顺序。
   - **搜索**：通过 `folium.omni.searchSongs()` 与 `listProviders()` 在弹窗内切换已配置音源直接搜歌，支持单击立即播放、加入播放队列、加入任务栏收藏与游标翻页。
@@ -47,7 +47,7 @@
 - `playback.read`：用于在主进程启动时经 `api.runtime.getPlaybackSnapshot()` 读取当前播放曲目、播放进度快照、歌词与主题初始状态。
 - `playback.control`：用于抽屉按键与快捷菜单控制播放/暂停、上一曲/下一曲、进度拖拽（Seek）、红心点赞（`toggleLike`）、音量与静音调节、循环模式切换、队列打乱、队列点播（`playQueueItem`）以及在线搜歌点播/入队（`playSong` / `enqueue`）。
 - `playback.queue`：用于在「探索」专辑/歌手页或「收藏」列表点击「播放全部」时，经官方 `folium.playback.replaceQueue()` 整表替换播放队列（支持宿主撤销并自动退出私人 FM）。
-- `filesystem.data`：用于经官方 `folium.storage` 在本模组专属数据文件中持久化「最近播放」与「快捷收藏夹」曲目键列表（不读写宿主或其他模组的任何文件）。
+- `filesystem.data`：用于经官方 `folium.storage` 在本模组专属数据文件中持久化「最近播放」、「快捷收藏夹」曲目键列表以及任务栏单曲歌词时间轴偏移（不读写宿主或其他模组的任何文件）。
 
 > 注：本模组还会使用无需额外权限的 `folium.omni` 公开目录接口（`listProviders`、`searchSongs`、`resolveSongs`、`describeSong`、`getAlbum`、`getArtists`、`resolveCollection`、`getTracks`、`getArtistAlbums`），以你在 Folia 中登录的在线音源账号发起公开搜索与专辑/歌手查询，不读取账号私有库也不上传任何数据。
 
@@ -62,7 +62,7 @@
 - **实时歌词**：通过 `folium.lyrics.getLines()`、`folium.lyrics.getLineRenderEndTime()` 与 `lyrics.loaded` 事件同步逐字歌词与行尾保持时间。
 - **公开在线目录与自有存储**：通过 `folium.omni` 实现切音源搜歌、当前曲目专辑/歌手浏览与曲目解析；通过 `folium.storage` 存储模组自有的最近播放与快捷收藏。
 - **全局快捷键与命令面板**：向 `folium.registries.commands` 注册支持 `globalShortcut: true` 的「展开/收起任务栏歌词」与「切换任务栏歌词显示器」命令，由宿主统一管理热键绑定（外部程序全屏时可一键收起）。
-- **尚未开放公开接口的功能说明**：账号个人歌单、私人 FM、宿主本地曲库及外部进程全屏检测目前尚不在 Folium 2.1 公开接口范围内，待后续宿主开放公开接口后再接入。
+- **尚未开放公开接口的功能说明**：账号个人歌单、私人 FM、宿主本地曲库、宿主主界面歌词偏移同步及外部进程全屏检测目前尚不在 Folium 2.1 公开接口范围内（其中歌词偏移已提供模组自有的全局设置 + 单曲微调替代），待后续宿主开放公开接口后再接入。
 
 ---
 
@@ -77,7 +77,9 @@
     1. **任务栏红心点赞按钮**（`folium.playback.toggleLike()` + `playback.likeChanged`）；
     2. **在线搜歌与音源切换**（`folium.omni.searchSongs()` + `listProviders()`，支持点播、入队与翻页）；
     3. **当前曲目专辑 / 歌手浏览**（`folium.omni.getAlbum()` / `getArtists()` / `getTracks()` / `getArtistAlbums()` + `replaceQueue()` 整表播放）；
-    4. **模组自有「最近播放」与「快捷收藏夹」**（`folium.storage` + `folium.omni.resolveSongs()` 跨平台还原点播）。
+    4. **模组自有「最近播放」与「快捷收藏夹」**（`folium.storage` + `folium.omni.resolveSongs()` 跨平台还原点播）；
+    5. **模组自有歌词时间轴偏移**（设置页全局 `ms` 偏移 + 弹窗底部单曲 `±0.2s` 快捷微调与重置，按曲目持久化于 `folium.storage` 并与全局偏移叠加生效）；
+  - 重构播放时钟同步逻辑：修复变量名拼写导致后续进度锚点停推、暂停后恢复播放进度条跳变、在线歌曲长时间加载或缓冲卡顿时进度条偷跑，以及暂停/播放态小幅回拖不同步的问题。
 
 ### v1.0.8
 - **适配 Folia 0.8.0 与 Folium 2.1 规范及交互视觉优化**：

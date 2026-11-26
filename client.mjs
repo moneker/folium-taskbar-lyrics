@@ -38,10 +38,16 @@ export default function activate(folium) {
   const QUEUE_PAGE_SIZE = 50;
   const MAX_RECENT_TRACKS = 50;
   const MAX_SAVED_TRACKS = 200;
+  const MAX_STORED_OFFSETS = 200;
+  const MIN_GLOBAL_OFFSET_MS = -5000;
+  const MAX_GLOBAL_OFFSET_MS = 5000;
+  const MIN_SONG_OFFSET_MS = -10000;
+  const MAX_SONG_OFFSET_MS = 10000;
   const MAX_CACHED_OMNI_SONGS = 300;
   const MAX_CACHED_OMNI_COLLECTIONS = 80;
   const STORAGE_KEY_RECENT = 'recent_tracks_v1';
   const STORAGE_KEY_SAVED = 'saved_tracks_v1';
+  const STORAGE_KEY_OFFSETS = 'song_lyric_offsets_v1';
 
   let currentQueuePageIndex = 0;
   let isDisposed = false;
@@ -57,9 +63,11 @@ export default function activate(folium) {
   const omniCollectionMap = new Map();
   let recentTracks = [];
   let savedTracks = [];
+  let songLyricOffsets = {};
   let storageLoaded = false;
   let pendingRecentOps = [];
   let pendingSavedOps = [];
+  let pendingOffsetOps = [];
 
   const DEFAULT_DARK_THEME = {
     name: 'Midnight Default',
@@ -79,6 +87,9 @@ export default function activate(folium) {
     duration: 0,
     updatedAt: Date.now(),
     lyrics: null,
+    lyricOffsetMs: 0,
+    songLyricOffsetMs: 0,
+    globalLyricOffsetMs: 0,
     liked: false,
     canLike: false,
     queue: [],
@@ -100,6 +111,7 @@ export default function activate(folium) {
       targetDisplay: 'primary',
       showTranslation: true,
       useCoverBackground: true,
+      globalLyricOffsetMs: 0,
     },
     hasPlaybackControls,
   };
@@ -416,22 +428,123 @@ export default function activate(folium) {
     return list;
   }
 
+  function clampOffsetMs(value, min, max) {
+    if (typeof value !== 'number' || !Number.isFinite(value)) return 0;
+    return Math.max(min, Math.min(max, Math.round(value)));
+  }
+
+  function songOffsetKey(song) {
+    if (!song) return '';
+    const portable = songPortableKey(song.source, song.id);
+    if (portable) return portable;
+    const title = typeof song.title === 'string' ? song.title.trim() : '';
+    const artist = typeof song.artist === 'string' ? song.artist.trim() : '';
+    if (!title && !artist) return '';
+    return `meta:${title}|${artist}`;
+  }
+
+  function normalizeStoredOffsets(raw) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+    const out = {};
+    const keys = Object.keys(raw);
+    const start = Math.max(0, keys.length - MAX_STORED_OFFSETS);
+    for (let i = start; i < keys.length; i++) {
+      const k = keys[i];
+      if (!k) continue;
+      const clamped = clampOffsetMs(Number(raw[k]), MIN_SONG_OFFSET_MS, MAX_SONG_OFFSET_MS);
+      if (clamped !== 0) {
+        out[k] = clamped;
+      }
+    }
+    return out;
+  }
+
+  function applyOffsetOp(mapObj, op) {
+    const next = { ...mapObj };
+    if (!op || !op.key) return next;
+    if (op.type === 'reset') {
+      delete next[op.key];
+      return next;
+    }
+    if (op.type === 'adjust') {
+      const prev = typeof next[op.key] === 'number' && Number.isFinite(next[op.key]) ? next[op.key] : 0;
+      const updated = clampOffsetMs(prev + (Number(op.deltaMs) || 0), MIN_SONG_OFFSET_MS, MAX_SONG_OFFSET_MS);
+      delete next[op.key];
+      if (updated !== 0) {
+        next[op.key] = updated;
+        const keys = Object.keys(next);
+        while (keys.length > MAX_STORED_OFFSETS) {
+          const oldest = keys.shift();
+          if (oldest !== undefined) delete next[oldest];
+        }
+      }
+    }
+    return next;
+  }
+
+  function syncEffectiveLyricOffset() {
+    const globalMs = clampOffsetMs(currentSnapshot.settings?.globalLyricOffsetMs, MIN_GLOBAL_OFFSET_MS, MAX_GLOBAL_OFFSET_MS);
+    const key = songOffsetKey(currentSnapshot.song);
+    const songMs = (key && typeof songLyricOffsets[key] === 'number' && Number.isFinite(songLyricOffsets[key]))
+      ? clampOffsetMs(songLyricOffsets[key], MIN_SONG_OFFSET_MS, MAX_SONG_OFFSET_MS)
+      : 0;
+    currentSnapshot.globalLyricOffsetMs = globalMs;
+    currentSnapshot.songLyricOffsetMs = songMs;
+    currentSnapshot.lyricOffsetMs = globalMs + songMs;
+    return {
+      lyricOffsetMs: currentSnapshot.lyricOffsetMs,
+      songLyricOffsetMs: songMs,
+      globalLyricOffsetMs: globalMs,
+    };
+  }
+
+  function adjustCurrentSongLyricOffset(deltaMs) {
+    const key = songOffsetKey(currentSnapshot.song);
+    if (!key) return;
+    const safeDelta = Math.round(Number(deltaMs) || 0);
+    if (safeDelta === 0) return;
+    const op = { type: 'adjust', key, deltaMs: safeDelta };
+    songLyricOffsets = applyOffsetOp(songLyricOffsets, op);
+    if (storageLoaded) {
+      void persistTrackList(STORAGE_KEY_OFFSETS, songLyricOffsets);
+    } else {
+      pendingOffsetOps.push(op);
+    }
+    void pushSnapshot(syncEffectiveLyricOffset());
+  }
+
+  function resetCurrentSongLyricOffset() {
+    const key = songOffsetKey(currentSnapshot.song);
+    if (!key) return;
+    const op = { type: 'reset', key };
+    songLyricOffsets = applyOffsetOp(songLyricOffsets, op);
+    if (storageLoaded) {
+      void persistTrackList(STORAGE_KEY_OFFSETS, songLyricOffsets);
+    } else {
+      pendingOffsetOps.push(op);
+    }
+    void pushSnapshot(syncEffectiveLyricOffset());
+  }
+
   async function loadStoredTrackLists() {
     if (!hasStorageApi || isDisposed) {
       storageLoaded = true;
       return;
     }
     try {
-      const [rawRecent, rawSaved] = await Promise.all([
+      const [rawRecent, rawSaved, rawOffsets] = await Promise.all([
         folium.storage.get(STORAGE_KEY_RECENT).catch(() => []),
         folium.storage.get(STORAGE_KEY_SAVED).catch(() => []),
+        folium.storage.get(STORAGE_KEY_OFFSETS).catch(() => ({})),
       ]);
       if (isDisposed) return;
 
       let mergedRecent = normalizeStoredList(rawRecent, MAX_RECENT_TRACKS);
       let mergedSaved = normalizeStoredList(rawSaved, MAX_SAVED_TRACKS);
+      let mergedOffsets = normalizeStoredOffsets(rawOffsets);
       const hadRecentOps = pendingRecentOps.length > 0;
       const hadSavedOps = pendingSavedOps.length > 0;
+      const hadOffsetOps = pendingOffsetOps.length > 0;
 
       for (const op of pendingRecentOps) {
         mergedRecent = applyRecentOp(mergedRecent, op);
@@ -439,18 +552,25 @@ export default function activate(folium) {
       for (const op of pendingSavedOps) {
         mergedSaved = applySavedOp(mergedSaved, op);
       }
+      for (const op of pendingOffsetOps) {
+        mergedOffsets = applyOffsetOp(mergedOffsets, op);
+      }
       pendingRecentOps = [];
       pendingSavedOps = [];
+      pendingOffsetOps = [];
       storageLoaded = true;
 
       recentTracks = mergedRecent;
       savedTracks = mergedSaved;
+      songLyricOffsets = mergedOffsets;
       currentSnapshot.recentTracks = recentTracks;
       currentSnapshot.savedTracks = savedTracks;
+      const offsetSnap = syncEffectiveLyricOffset();
 
       if (hadRecentOps) void persistTrackList(STORAGE_KEY_RECENT, recentTracks);
       if (hadSavedOps) void persistTrackList(STORAGE_KEY_SAVED, savedTracks);
-      void pushSnapshot({ recentTracks, savedTracks });
+      if (hadOffsetOps) void persistTrackList(STORAGE_KEY_OFFSETS, songLyricOffsets);
+      void pushSnapshot({ recentTracks, savedTracks, ...offsetSnap });
     } catch {
       storageLoaded = true;
     }
@@ -1225,23 +1345,16 @@ export default function activate(folium) {
   // High-Precision Background-Resilient Audio Clock
   // =========================================================================
 
+  const STALL_FREEZE_MS = 600;
   let lastObservedHostPos = -1;
   let lastObservedHostWallTime = 0;
-  let songSwitchWallTime = 0;
+  let lastObservedHostState = 'paused';
+  let waitingForPlaybackAdvance = false;
   let pendingSeekTarget = null;
   let pendingSeekWallTime = 0;
   let lastLocalSeekWallTime = 0;
   let quickSyncTimerA = null;
   let quickSyncTimerB = null;
-
-  function isPlaybackStoreActive() {
-    try {
-      const hostState = folium.playback.getState();
-      return hostState?.state === 'playing';
-    } catch {
-      return true;
-    }
-  }
 
   function samplePlaybackClock() {
     const now = Date.now();
@@ -1256,73 +1369,147 @@ export default function activate(folium) {
       : currentSnapshot.duration;
 
     const hostPos = (typeof hostState?.position === 'number' && Number.isFinite(hostState.position))
-      ? hostState.position
+      ? Math.max(0, hostState.position)
       : null;
 
-    const hostPosChanged = hostPos !== null && Math.abs(hostPos - lastObservedHostPos) > 0.0005;
-    if (hostPosChanged) {
-      lastObservedHostPos = hostPos;
-      lastObservedHostWallTime = now;
+    const transitionedToPlaying = state === 'playing' && lastObservedHostState !== 'playing';
+    lastObservedHostState = state;
+
+    const inSeekWindow = pendingSeekTarget !== null && (now - pendingSeekWallTime) < 1500;
+    if (!inSeekWindow && pendingSeekTarget !== null) {
+      pendingSeekTarget = null;
     }
 
-    const isStorePlaying = isPlaybackStoreActive();
-    const inSeekWindow = pendingSeekTarget !== null && (now - pendingSeekWallTime) < 1500;
-    const inSwitchWindow = (now - songSwitchWallTime) < 2500;
-
-    if (state !== 'playing' || !isStorePlaying) {
+    if (state !== 'playing') {
       let heldPos = currentSnapshot.currentTime;
       if (inSeekWindow) {
-        heldPos = pendingSeekTarget;
-      } else if (inSwitchWindow) {
-        heldPos = 0;
+        if (hostPos !== null && Math.abs(hostPos - pendingSeekTarget) < 0.8) {
+          pendingSeekTarget = null;
+          heldPos = hostPos;
+        } else {
+          heldPos = pendingSeekTarget;
+        }
       } else if (hostPos !== null) {
-        heldPos = Math.max(0, hostPos);
+        heldPos = hostPos;
       }
+      const clampedHeld = duration > 0 ? Math.min(duration, heldPos) : heldPos;
+      const backwardJump = lastObservedHostPos >= 0 && (lastObservedHostPos - clampedHeld) > 0.15;
+      lastObservedHostPos = clampedHeld;
+      lastObservedHostWallTime = now;
+      waitingForPlaybackAdvance = false;
       return {
-        position: duration > 0 ? Math.min(duration, heldPos) : heldPos,
+        position: clampedHeld,
         duration,
         state,
         isAdvancing: false,
         updatedAt: now,
         isFresh: true,
+        backwardJump,
       };
+    }
+
+    if (transitionedToPlaying) {
+      // Never extrapolate elapsed pause time into playback position on resume
+      if (hostPos !== null && !inSeekWindow) {
+        lastObservedHostPos = hostPos;
+      }
+      lastObservedHostWallTime = now;
+      waitingForPlaybackAdvance = true;
     }
 
     if (inSeekWindow) {
       if (hostPos !== null && Math.abs(hostPos - pendingSeekTarget) < 0.8) {
         pendingSeekTarget = null;
-      } else {
+        lastObservedHostPos = hostPos;
+        lastObservedHostWallTime = now;
+        waitingForPlaybackAdvance = true;
         return {
-          position: duration > 0 ? Math.min(duration, pendingSeekTarget) : pendingSeekTarget,
+          position: duration > 0 ? Math.min(duration, hostPos) : hostPos,
           duration,
           state,
           isAdvancing: false,
           updatedAt: now,
           isFresh: true,
+          backwardJump: false,
         };
       }
-    }
-
-    if (inSwitchWindow) {
-      if (hostPos === null || hostPos <= 0.005) {
-        return {
-          position: 0,
-          duration,
-          state,
-          isAdvancing: false,
-          updatedAt: now,
-          isFresh: true,
-        };
-      }
-      songSwitchWallTime = 0;
+      // Do not overwrite lastObservedHostPos with stale pre-seek decoder readings
+      lastObservedHostWallTime = now;
+      return {
+        position: duration > 0 ? Math.min(duration, pendingSeekTarget) : pendingSeekTarget,
+        duration,
+        state,
+        isAdvancing: false,
+        updatedAt: now,
+        isFresh: true,
+        backwardJump: false,
+      };
     }
 
     if (hostPos !== null) {
-      if (!hostPosChanged && lastObservedHostWallTime > 0) {
-        const elapsedSec = Math.max(0, (now - lastObservedHostWallTime) / 1000);
+      const prevObserved = lastObservedHostPos;
+      const hostPosChanged = prevObserved < 0 || Math.abs(hostPos - prevObserved) > 0.0005;
+      const backwardJump = prevObserved >= 0 && (prevObserved - hostPos) > 0.15;
+
+      if (hostPosChanged) {
+        lastObservedHostPos = hostPos;
+        lastObservedHostWallTime = now;
+        if (waitingForPlaybackAdvance) {
+          if (hostPos <= 0.005) {
+            return {
+              position: 0,
+              duration,
+              state,
+              isAdvancing: false,
+              updatedAt: now,
+              isFresh: true,
+              backwardJump,
+            };
+          }
+          waitingForPlaybackAdvance = false;
+        } else if (prevObserved < 0 && hostPos <= 0.005) {
+          // Cold start while a track is still loading at 0:00: wait for first real advance
+          waitingForPlaybackAdvance = true;
+          return {
+            position: 0,
+            duration,
+            state,
+            isAdvancing: false,
+            updatedAt: now,
+            isFresh: true,
+            backwardJump: false,
+          };
+        }
+        return {
+          position: duration > 0 ? Math.min(duration, hostPos) : hostPos,
+          duration,
+          state,
+          isAdvancing: true,
+          updatedAt: now,
+          isFresh: true,
+          backwardJump,
+        };
+      }
+
+      if (waitingForPlaybackAdvance) {
+        // Still waiting for audio clock to start advancing (loading, resume, or post-seek settle)
+        lastObservedHostWallTime = now;
+        return {
+          position: duration > 0 ? Math.min(duration, hostPos) : hostPos,
+          duration,
+          state,
+          isAdvancing: false,
+          updatedAt: now,
+          isFresh: true,
+          backwardJump: false,
+        };
+      }
+
+      const silentMs = lastObservedHostWallTime > 0 ? Math.max(0, now - lastObservedHostWallTime) : 0;
+      if (silentMs <= STALL_FREEZE_MS) {
         const extrapolated = duration > 0
-          ? Math.min(duration, hostPos + elapsedSec)
-          : (hostPos + elapsedSec);
+          ? Math.min(duration, hostPos + silentMs / 1000)
+          : (hostPos + silentMs / 1000);
         return {
           position: extrapolated,
           duration,
@@ -1330,15 +1517,19 @@ export default function activate(folium) {
           isAdvancing: true,
           updatedAt: now,
           isFresh: false,
+          backwardJump: false,
         };
       }
+
+      // Host clock has not moved for > STALL_FREEZE_MS: hold at real hostPos instead of running away
       return {
-        position: hostPos,
+        position: duration > 0 ? Math.min(duration, hostPos) : hostPos,
         duration,
         state,
-        isAdvancing: true,
+        isAdvancing: false,
         updatedAt: now,
         isFresh: true,
+        backwardJump: false,
       };
     }
 
@@ -1349,6 +1540,7 @@ export default function activate(folium) {
       isAdvancing: false,
       updatedAt: now,
       isFresh: false,
+      backwardJump: false,
     };
   }
 
@@ -1366,7 +1558,14 @@ export default function activate(folium) {
         currentSnapshot.playerState = clock.state;
         currentSnapshot.isAdvancing = clock.isAdvancing;
         currentSnapshot.currentTime = clock.position;
-        currentSnapshot.duration = clock.duration;
+        if (clock.duration > 0) {
+          currentSnapshot.duration = clock.duration;
+        } else if (state.song) {
+          const metaDur = resolveSongDetails(state.song).durationSec;
+          currentSnapshot.duration = (typeof metaDur === 'number' && metaDur > 0) ? metaDur : 0;
+        } else {
+          currentSnapshot.duration = 0;
+        }
         currentSnapshot.updatedAt = clock.updatedAt;
       }
       syncHostLyricsAndSong();
@@ -1507,6 +1706,22 @@ export default function activate(folium) {
         },
         defaultValue: true,
       },
+      {
+        key: 'globalLyricOffsetMs',
+        type: 'number',
+        label: {
+          'zh-CN': '任务栏歌词全局偏移 (ms)',
+          en: 'Taskbar Lyric Global Offset (ms)',
+        },
+        description: {
+          'zh-CN': '整体平移任务栏歌词时间轴，正数让歌词更晚出现（适合补偿蓝牙等设备延迟）；会与弹窗底部的单曲微调叠加生效',
+          en: 'Shift the taskbar lyric timeline globally in milliseconds (positive delays lyrics). Sums with per-song adjustments.',
+        },
+        defaultValue: 0,
+        min: MIN_GLOBAL_OFFSET_MS,
+        max: MAX_GLOBAL_OFFSET_MS,
+        step: 50,
+      },
     ],
   });
 
@@ -1554,12 +1769,15 @@ export default function activate(folium) {
         const useBg = values?.useCoverBackground;
         const mode = values?.interactionMode === 'hover-hide' ? 'hover-hide' : 'standard';
         const display = normalizeDisplayTarget(values?.targetDisplay);
+        const globalOffsetMs = clampOffsetMs(Number(values?.globalLyricOffsetMs), MIN_GLOBAL_OFFSET_MS, MAX_GLOBAL_OFFSET_MS);
         currentSnapshot.settings = {
           interactionMode: mode,
           targetDisplay: display,
           showTranslation: typeof showTr === 'boolean' ? showTr : true,
           useCoverBackground: typeof useBg === 'boolean' ? useBg : true,
+          globalLyricOffsetMs: globalOffsetMs,
         };
+        syncEffectiveLyricOffset();
       }
     } catch {
       // Ignored
@@ -1573,7 +1791,10 @@ export default function activate(folium) {
   if (typeof settingsAccess?.onChange === 'function') {
     unsubs.push(settingsAccess.onChange(() => {
       syncSettings();
-      void pushSnapshot({ settings: currentSnapshot.settings });
+      void pushSnapshot({
+        settings: currentSnapshot.settings,
+        ...syncEffectiveLyricOffset(),
+      });
     }));
   }
 
@@ -1613,6 +1834,7 @@ export default function activate(folium) {
       const prevState = currentSnapshot.playerState;
       const prevAdvancing = Boolean(currentSnapshot.isAdvancing);
       const prevDuration = currentSnapshot.duration;
+      const effectiveIsSeek = Boolean(isSeek || clock.backwardJump);
 
       currentSnapshot.currentTime = pos;
       currentSnapshot.playerState = state;
@@ -1622,7 +1844,7 @@ export default function activate(folium) {
 
       const durationChanged = clock.duration !== prevDuration;
 
-      if (!force && !clock.isFresh && state === prevState && isAdvancing === prevAdvancing && !durationChanged) {
+      if (!force && !effectiveIsSeek && !clock.isFresh && state === prevState && isAdvancing === prevAdvancing && !durationChanged) {
         return;
       }
 
@@ -1633,17 +1855,18 @@ export default function activate(folium) {
         ? lastAudioSyncPushedTime + elapsedWallSec
         : -1;
       const driftFromExtrapolation = expectedExtrapolatedPos >= 0
-        ? Math.abs(pos - expectedExtrapolation)
+        ? Math.abs(pos - expectedExtrapolatedPos)
         : 999;
       const wallDiff = now - lastAudioSyncPushWallTime;
 
       const shouldPush = force
+        || effectiveIsSeek
         || lastAudioSyncPushedTime < 0
         || state !== prevState
         || isAdvancing !== prevAdvancing
         || durationChanged
         || driftFromExtrapolation >= 0.08
-        || (state === 'playing' && isAdvancing && wallDiff >= 400);
+        || (state === 'playing' && isAdvancing && wallDiff >= 250);
 
       if (shouldPush) {
         lastAudioSyncPushedTime = pos;
@@ -1654,11 +1877,13 @@ export default function activate(folium) {
           playerState: state,
           isAdvancing,
           updatedAt: now,
-          isSeek: Boolean(isSeek),
+          isSeek: effectiveIsSeek,
         });
       }
-    } catch {
-      // Ignored
+    } catch (err) {
+      if (!isDisposed) {
+        folium.log.warn('pushPlaybackAnchor failed', err);
+      }
     }
   }
 
@@ -1667,25 +1892,20 @@ export default function activate(folium) {
   // 1. Song changed
   unsubs.push(folium.events.on('playback.songChanged', (event) => {
     const now = Date.now();
-    songSwitchWallTime = now;
     pendingSeekTarget = null;
     pendingSeekWallTime = 0;
-    currentSnapshot.currentTime = 0;
-    currentSnapshot.isAdvancing = false;
-    currentSnapshot.updatedAt = now;
-    lastAudioSyncPushedTime = 0;
-    lastAudioSyncPushWallTime = now;
-    lastObservedHostPos = 0;
-    lastObservedHostWallTime = now;
+    waitingForPlaybackAdvance = true;
 
+    let resolvedDuration = 0;
     try {
       const hostState = folium.playback.getState();
       if (hostState) {
         currentSnapshot.playerState = normalizePlayerState(hostState.state || currentSnapshot.playerState);
+        lastObservedHostState = currentSnapshot.playerState;
         currentSnapshot.liked = Boolean(hostState.liked);
         currentSnapshot.canLike = Boolean(hostState.canLike);
-        if (typeof hostState.duration === 'number' && Number.isFinite(hostState.duration) && hostState.duration >= 0) {
-          currentSnapshot.duration = hostState.duration;
+        if (typeof hostState.duration === 'number' && Number.isFinite(hostState.duration) && hostState.duration > 0) {
+          resolvedDuration = hostState.duration;
         }
       }
     } catch {}
@@ -1694,13 +1914,30 @@ export default function activate(folium) {
     if (event && event.song) {
       rememberOmniSong(event.song);
       currentSnapshot.song = buildSongSnapshot(event.song);
+      if (resolvedDuration <= 0) {
+        const metaDuration = resolveSongDetails(event.song).durationSec;
+        if (typeof metaDuration === 'number' && metaDuration > 0) {
+          resolvedDuration = metaDuration;
+        }
+      }
     } else if (event && event.song === null) {
       currentSnapshot.song = null;
       currentSnapshot.liked = false;
       currentSnapshot.canLike = false;
+      resolvedDuration = 0;
     }
 
+    currentSnapshot.duration = resolvedDuration;
+    currentSnapshot.currentTime = 0;
+    currentSnapshot.isAdvancing = false;
+    currentSnapshot.updatedAt = now;
+    lastAudioSyncPushedTime = 0;
+    lastAudioSyncPushWallTime = now;
+    lastObservedHostPos = 0;
+    lastObservedHostWallTime = now;
+
     syncHostLyricsAndSong(true, hasEventSong);
+    const offsetSnap = syncEffectiveLyricOffset();
     if (currentSnapshot.song) {
       recordRecentSong(currentSnapshot.song);
     }
@@ -1708,6 +1945,7 @@ export default function activate(folium) {
     void pushSnapshot({
       song: currentSnapshot.song,
       lyrics: currentSnapshot.lyrics,
+      ...offsetSnap,
       liked: currentSnapshot.liked,
       canLike: currentSnapshot.canLike,
       recentTracks: currentSnapshot.recentTracks,
@@ -1751,7 +1989,6 @@ export default function activate(folium) {
   // 4. Seeked
   unsubs.push(folium.events.on('playback.seeked', (event) => {
     const now = Date.now();
-    songSwitchWallTime = 0;
     const eventPos = (typeof event?.position === 'number' && Number.isFinite(event.position))
       ? Math.max(0, event.position)
       : null;
@@ -1768,6 +2005,8 @@ export default function activate(folium) {
     const clock = samplePlaybackClock();
     const pos = eventPos !== null ? eventPos : clock.position;
     currentSnapshot.currentTime = pos;
+    currentSnapshot.duration = clock.duration;
+    currentSnapshot.playerState = clock.state;
     currentSnapshot.isAdvancing = clock.isAdvancing;
     currentSnapshot.updatedAt = now;
     lastAudioSyncPushedTime = pos;
@@ -1880,7 +2119,10 @@ export default function activate(folium) {
 
   // Initial Sync
   refreshPlaybackState();
+  lastAudioSyncPushedTime = currentSnapshot.currentTime;
+  lastAudioSyncPushWallTime = currentSnapshot.updatedAt;
   syncHostLyricsAndSong();
+  const initialOffsets = syncEffectiveLyricOffset();
   refreshAudioState();
   refreshQueue();
   refreshProviders();
@@ -1894,6 +2136,7 @@ export default function activate(folium) {
     duration: currentSnapshot.duration,
     updatedAt: currentSnapshot.updatedAt,
     lyrics: currentSnapshot.lyrics,
+    ...initialOffsets,
     liked: currentSnapshot.liked,
     canLike: currentSnapshot.canLike,
     queue: currentSnapshot.queue,
@@ -1950,13 +2193,16 @@ export default function activate(folium) {
         }
         break;
       case 'seek':
-        if (typeof item.payload === 'number') {
-          const targetTime = Math.max(0, item.payload);
+        if (typeof item.payload === 'number' && Number.isFinite(item.payload)) {
+          const rawTarget = Math.max(0, item.payload);
+          const targetTime = currentSnapshot.duration > 0
+            ? Math.min(currentSnapshot.duration, rawTarget)
+            : rawTarget;
           const now = Date.now();
-          songSwitchWallTime = 0;
           lastLocalSeekWallTime = now;
           pendingSeekTarget = targetTime;
           pendingSeekWallTime = now;
+          waitingForPlaybackAdvance = true;
           currentSnapshot.currentTime = targetTime;
           currentSnapshot.updatedAt = now;
           currentSnapshot.isAdvancing = false;
@@ -1964,6 +2210,14 @@ export default function activate(folium) {
           lastAudioSyncPushWallTime = now;
           lastObservedHostPos = targetTime;
           lastObservedHostWallTime = now;
+          void pushSnapshot({
+            currentTime: targetTime,
+            duration: currentSnapshot.duration,
+            playerState: currentSnapshot.playerState,
+            isAdvancing: false,
+            updatedAt: now,
+            isSeek: true,
+          });
           folium.playback.seek(targetTime);
           scheduleQuickClockSync();
         }
@@ -2141,6 +2395,12 @@ export default function activate(folium) {
         break;
       case 'playAllStoredTracks':
         await handlePlayStoredTracks(item.payload);
+        break;
+      case 'adjustSongLyricOffset':
+        adjustCurrentSongLyricOffset(item.payload);
+        break;
+      case 'resetSongLyricOffset':
+        resetCurrentSongLyricOffset();
         break;
     }
   }

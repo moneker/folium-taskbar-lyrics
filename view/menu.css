@@ -656,6 +656,74 @@ html, body {
   display: none;
 }
 
+/* Lyric Offset Row */
+.offset-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.offset-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11.5px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.offset-controls {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.offset-step-btn,
+.offset-value-btn {
+  background: var(--bg-card);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
+  height: 24px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 550;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+  transition: all 0.16s ease;
+  outline: none;
+}
+
+.offset-step-btn {
+  padding: 0 7px;
+}
+
+.offset-value-btn {
+  min-width: 58px;
+  padding: 0 8px;
+  color: var(--text-primary);
+}
+
+.offset-value-btn.has-offset {
+  background: var(--bg-card-active);
+  border-color: var(--border-highlight);
+  color: var(--accent-fg);
+}
+
+.offset-step-btn:hover:not(:disabled),
+.offset-value-btn:hover:not(:disabled) {
+  background: var(--button-hover-bg);
+  color: var(--text-primary);
+  border-color: var(--border-highlight);
+}
+
+.offset-step-btn:disabled,
+.offset-value-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
 /* Volume Row */
 .volume-row {
   display: flex;

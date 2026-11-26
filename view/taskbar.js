@@ -95,6 +95,8 @@
     currentActiveLine = null;
     lastWipeLineIndex = -999;
     lastWipePct = 0;
+    lastDisplayedSecond = -1;
+    lastProgressPctStr = '';
   }
 
   function setWipeCssProperty(pctValue) {
@@ -125,7 +127,7 @@
       }
     }
     if (advancing) {
-      if (t < lastRenderedAudioTime && (lastRenderedAudioTime - t) < 1.5) {
+      if (t < lastRenderedAudioTime && (lastRenderedAudioTime - t) < 0.8) {
         t = lastRenderedAudioTime;
       } else {
         lastRenderedAudioTime = t;
@@ -642,15 +644,24 @@
         const incomingLiveTime = data.currentTime + incomingElapsed;
         const timeDelta = incomingLiveTime - lastRenderedAudioTime;
 
-        if (isDiscontinuous || Math.abs(timeDelta) >= 1.5) {
-          // Intentional seek, song change, or large correction (>1.5s)
+        if (isDiscontinuous || Math.abs(timeDelta) >= 0.8) {
+          // Intentional seek, song change, or noticeable correction (>=0.8s)
           nextCurrentTime = data.currentTime;
           nextUpdatedAt = incomingStamp;
           resetMonotonicTrackers(incomingLiveTime);
           isDiscontinuous = true;
-        } else if (nextState !== 'playing' || !nextAdvancing) {
-          // Paused or audio is loading/buffering/seeking: hold clock without resetting activeLineIndex
-          nextCurrentTime = timeDelta >= 0 ? data.currentTime : lastRenderedAudioTime;
+        } else if (nextState !== 'playing') {
+          // Paused or stopped: always trust host position directly (including backward seeks)
+          nextCurrentTime = Math.max(0, data.currentTime);
+          nextUpdatedAt = now;
+          lastRenderedAudioTime = nextCurrentTime;
+          clockRate = 1.0;
+          if (timeDelta < -0.05) {
+            isDiscontinuous = true;
+          }
+        } else if (!nextAdvancing) {
+          // Audio is loading/buffering/stalled while playing: hold at real host position
+          nextCurrentTime = Math.max(0, data.currentTime);
           nextUpdatedAt = now;
           lastRenderedAudioTime = nextCurrentTime;
           clockRate = 1.0;
@@ -661,8 +672,8 @@
           lastRenderedAudioTime = incomingLiveTime;
           clockRate = 1.0;
         } else {
-          // Incoming snapshot is slightly behind local extrapolation (-1.5s < timeDelta < 0) due to
-          // background timer throttling, memory pressure, or IPC delay.
+          // Incoming snapshot is slightly behind local extrapolation (-0.8s < timeDelta < 0) due to
+          // background timer throttling or IPC delay.
           // Pin to lastRenderedAudioTime so the lyric wipe and line never bounce backward, and
           // gently slow clockRate until the real audio clock catches up.
           nextCurrentTime = lastRenderedAudioTime;
@@ -670,6 +681,10 @@
           clockRate = timeDelta < -0.2 ? 0.65 : (timeDelta < -0.05 ? 0.85 : 1.0);
         }
       }
+    } else if (isSongChanged) {
+      nextCurrentTime = 0;
+      nextUpdatedAt = now;
+      clockRate = 1.0;
     } else if (
       (data.playerState !== undefined && data.playerState !== snapshot.playerState) ||
       (data.isAdvancing !== undefined && Boolean(data.isAdvancing) !== snapshot.isAdvancing)
@@ -1033,18 +1048,21 @@
 
     // Progress bar fill (deduplicated)
     if (snapshot.duration > 0) {
-      const pct = Math.min(100, Math.max(0, (audioTime / snapshot.duration) * 100)).toFixed(1);
+      const pctNum = Math.min(100, Math.max(0, (audioTime / snapshot.duration) * 100));
+      const pct = pctNum.toFixed(1);
       if (pct !== lastProgressPctStr) {
         lastProgressPctStr = pct;
         progressFill.style.width = `${pct}%`;
         progressThumb.style.left = `${pct}%`;
         progressBar.style.setProperty('--progress-pct', `${pct}%`);
+        progressBar.setAttribute('aria-valuenow', String(Math.round(pctNum)));
       }
     } else if (lastProgressPctStr !== '0.0') {
       lastProgressPctStr = '0.0';
       progressFill.style.width = '0%';
       progressThumb.style.left = '0%';
       progressBar.style.setProperty('--progress-pct', '0%');
+      progressBar.setAttribute('aria-valuenow', '0');
     }
 
     const lyricTime = getEffectiveLyricTime();
