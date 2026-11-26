@@ -1,0 +1,404 @@
+/* mods/taskbar-lyrics/view/radial.css: Styling & choreographed animations for the rotary cover-art radial playlist wheel */
+
+:root {
+  --wheel-bg: rgba(20, 20, 28, 0.92);
+  --wheel-bg-hover: rgba(42, 44, 62, 0.96);
+  --wheel-scrim: rgba(12, 12, 18, 0.62);
+  --wheel-scrim-hover: rgba(12, 12, 18, 0.36);
+  --wheel-border: rgba(255, 255, 255, 0.2);
+  --wheel-hub-bg: rgba(16, 16, 22, 0.94);
+  --wheel-text: #f8fafc;
+  --wheel-sub: rgba(248, 250, 252, 0.72);
+  --wheel-accent: #6366f1;
+  --wheel-accent-soft: rgba(99, 102, 241, 0.32);
+  --wheel-like: #fb7185;
+  --wheel-like-soft: rgba(251, 113, 133, 0.34);
+  --wheel-ok: #34d399;
+  --wheel-err: #f87171;
+}
+
+:root.daylight, body.daylight {
+  --wheel-bg: rgba(248, 248, 250, 0.95);
+  --wheel-bg-hover: rgba(255, 255, 255, 0.99);
+  --wheel-scrim: rgba(24, 24, 30, 0.48);
+  --wheel-scrim-hover: rgba(24, 24, 30, 0.28);
+  --wheel-border: rgba(255, 255, 255, 0.42);
+  --wheel-hub-bg: rgba(252, 252, 254, 0.96);
+  --wheel-text: #18181b;
+  --wheel-sub: rgba(24, 24, 27, 0.64);
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+  user-select: none;
+  -webkit-user-drag: none;
+  font-family: "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+}
+
+html, body {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: transparent;
+}
+
+/* Whole wheel rotational sweep entrance (left -> right) & smooth retract exit */
+.radial-root {
+  position: relative;
+  width: 328px;
+  height: 196px;
+  background: transparent;
+  opacity: 0;
+  transform: rotate(-42deg) scale(0.76) translateY(14px);
+  transform-origin: 164px 180px;
+  transition:
+    opacity 0.28s cubic-bezier(0.16, 1, 0.3, 1),
+    transform 0.34s cubic-bezier(0.16, 1, 0.3, 1);
+  will-change: transform, opacity;
+}
+
+.radial-root.placement-bottom {
+  transform: rotate(42deg) scale(0.76) translateY(-14px);
+  transform-origin: 164px 16px;
+}
+
+.radial-root.visible {
+  opacity: 1;
+  transform: rotate(0deg) scale(1) translateY(0);
+}
+
+.radial-root.closing {
+  opacity: 0;
+  transform: rotate(24deg) scale(0.78) translateY(16px);
+  transition:
+    opacity 0.2s cubic-bezier(0.4, 0, 1, 1),
+    transform 0.22s cubic-bezier(0.4, 0, 1, 1);
+  pointer-events: none;
+}
+
+.radial-root.placement-bottom.closing {
+  transform: rotate(-24deg) scale(0.78) translateY(-16px);
+}
+
+.wheel-svg {
+  display: block;
+  width: 328px;
+  height: 196px;
+  overflow: visible;
+  filter: drop-shadow(0 8px 20px rgba(0, 0, 0, 0.44));
+}
+
+:root.daylight .wheel-svg {
+  filter: drop-shadow(0 8px 18px rgba(0, 0, 0, 0.2));
+}
+
+.wheel-sector {
+  cursor: pointer;
+}
+
+.wheel-sector.disabled {
+  cursor: default;
+}
+
+.wheel-sector .sector-hit {
+  fill: transparent;
+  stroke: none;
+}
+
+/* Inner visual container handles radial hover pop + staggered launch entrance */
+.wheel-sector .sector-launch {
+  pointer-events: none;
+  opacity: 0;
+  transform: translateY(20px) scale(0.82);
+  transition:
+    opacity 0.26s cubic-bezier(0.16, 1, 0.3, 1),
+    transform 0.32s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.radial-root.placement-bottom .wheel-sector .sector-launch {
+  transform: translateY(-20px) scale(0.82);
+}
+
+.radial-root.visible .wheel-dial.launched .wheel-sector .sector-launch {
+  opacity: 1;
+  transform: translateY(0) scale(1);
+}
+
+.radial-root.closing .wheel-dial .wheel-sector .sector-launch {
+  opacity: 0;
+  transform: translateY(14px) scale(0.86);
+  transition:
+    opacity 0.17s ease-in,
+    transform 0.19s ease-in;
+}
+
+.radial-root.placement-bottom.closing .wheel-dial .wheel-sector .sector-launch {
+  transform: translateY(-14px) scale(0.86);
+}
+
+.wheel-sector.disabled .sector-launch {
+  filter: grayscale(0.45);
+}
+
+.radial-root.visible .wheel-dial.launched .wheel-sector.disabled .sector-launch {
+  opacity: 0.48;
+}
+
+.wheel-sector .sector-pop {
+  pointer-events: none;
+  transition: transform 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.wheel-sector .sector-base {
+  fill: var(--wheel-bg);
+  transition: fill 0.16s ease;
+}
+
+.wheel-sector.like-sector.liked .sector-base {
+  fill: var(--wheel-like-soft);
+}
+
+.wheel-sector .sector-cover {
+  opacity: 0.92;
+  transition: opacity 0.16s ease;
+}
+
+.wheel-sector .sector-scrim {
+  fill: var(--wheel-scrim);
+  transition: fill 0.16s ease;
+}
+
+.wheel-sector:not(.disabled):hover .sector-scrim {
+  fill: var(--wheel-scrim-hover);
+}
+
+.wheel-sector.like-sector.liked .sector-scrim {
+  fill: rgba(159, 18, 57, 0.42);
+}
+
+.wheel-sector.like-sector.liked:not(.disabled):hover .sector-scrim {
+  fill: rgba(190, 24, 93, 0.28);
+}
+
+.wheel-sector .sector-border {
+  fill: none;
+  stroke: var(--wheel-border);
+  stroke-width: 1.25;
+  transition: stroke 0.15s ease, stroke-width 0.15s ease;
+}
+
+.wheel-sector:not(.disabled):hover .sector-border,
+.wheel-sector.busy .sector-border {
+  stroke: var(--wheel-accent);
+  stroke-width: 1.9;
+}
+
+.wheel-sector.like-sector.liked .sector-border {
+  stroke: rgba(251, 113, 133, 0.78);
+}
+
+.wheel-sector.like-sector:not(.disabled):hover .sector-border {
+  stroke: var(--wheel-like);
+  stroke-width: 1.9;
+}
+
+/* Already-collected playlist highlight (clearly marks collected state; hovering previews removal) */
+.wheel-sector.collected {
+  cursor: pointer;
+}
+
+.wheel-sector.collected.locked-collected {
+  cursor: default;
+}
+
+.wheel-sector.collected .sector-scrim {
+  fill: rgba(6, 95, 70, 0.44);
+}
+
+.wheel-sector.collected .sector-border {
+  stroke: var(--wheel-ok);
+  stroke-width: 2;
+}
+
+.wheel-sector.collected .sector-icon {
+  stroke: var(--wheel-ok);
+  stroke-width: 2.6;
+}
+
+.wheel-sector.collected:not(.locked-collected):hover .sector-scrim {
+  fill: rgba(159, 18, 57, 0.34);
+}
+
+.wheel-sector.collected:not(.locked-collected):hover .sector-border {
+  stroke: var(--wheel-like);
+  stroke-width: 2;
+}
+
+.wheel-sector.collected:not(.locked-collected):hover .sector-icon {
+  stroke: #fda4af;
+}
+
+/* Over-cover icon and label always stay crisp white with subtle drop shadow for maximum legibility */
+.sector-icon {
+  fill: none;
+  stroke: #ffffff;
+  stroke-width: 2.1;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  pointer-events: none;
+  filter: drop-shadow(0 1px 3px rgba(0, 0, 0, 0.72));
+  transition: stroke 0.14s ease, fill 0.14s ease;
+}
+
+.wheel-sector.no-cover .sector-icon {
+  stroke: var(--wheel-text);
+  filter: none;
+}
+
+.wheel-sector.like-sector.liked .sector-icon {
+  fill: var(--wheel-like);
+  stroke: var(--wheel-like);
+}
+
+.wheel-sector.like-sector:not(.disabled):hover .sector-icon {
+  stroke: #fda4af;
+}
+
+.sector-label {
+  fill: #ffffff;
+  font-size: 11px;
+  font-weight: 600;
+  text-anchor: middle;
+  dominant-baseline: middle;
+  pointer-events: none;
+  paint-order: stroke;
+  stroke: rgba(0, 0, 0, 0.62);
+  stroke-width: 2.4px;
+  stroke-linejoin: round;
+}
+
+.wheel-sector.no-cover .sector-label {
+  fill: var(--wheel-text);
+  stroke: none;
+}
+
+.sector-label.compact {
+  font-size: 10px;
+}
+
+/* Hub controls row: [‹] [hubBadge] [›] */
+.hub-controls {
+  position: absolute;
+  left: 164px;
+  top: 158px;
+  transform: translate(-50%, -50%) scale(0.84);
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  opacity: 0;
+  transition:
+    opacity 0.24s ease 0.05s,
+    transform 0.28s cubic-bezier(0.16, 1, 0.3, 1) 0.04s;
+}
+
+.radial-root.placement-bottom .hub-controls {
+  top: 38px;
+}
+
+.radial-root.visible .hub-controls {
+  opacity: 1;
+  transform: translate(-50%, -50%) scale(1);
+}
+
+.radial-root.closing .hub-controls {
+  opacity: 0;
+  transform: translate(-50%, -50%) scale(0.84);
+  transition: opacity 0.15s ease, transform 0.16s ease;
+}
+
+.rot-btn {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  border: 1px solid var(--wheel-border);
+  background: var(--wheel-hub-bg);
+  color: var(--wheel-text);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.32);
+  transition: transform 0.14s ease, border-color 0.14s ease, color 0.14s ease;
+  outline: none;
+  flex-shrink: 0;
+}
+
+.rot-btn:hover {
+  border-color: var(--wheel-accent);
+  color: var(--wheel-accent);
+  transform: scale(1.1);
+}
+
+.rot-btn:active {
+  transform: scale(0.92);
+}
+
+.rot-btn.hidden {
+  display: none;
+}
+
+.hub-badge {
+  width: 96px;
+  padding: 5px 8px;
+  border-radius: 14px;
+  background: var(--wheel-hub-bg);
+  border: 1px solid var(--wheel-border);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.34);
+  text-align: center;
+  pointer-events: none;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1px;
+  transition: border-color 0.15s ease;
+}
+
+.hub-badge.feedback-ok {
+  border-color: var(--wheel-ok);
+}
+
+.hub-badge.feedback-err {
+  border-color: var(--wheel-err);
+}
+
+.hub-title {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--wheel-text);
+  max-width: 82px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  line-height: 1.25;
+}
+
+.hub-badge.feedback-ok .hub-title {
+  color: var(--wheel-ok);
+}
+
+.hub-badge.feedback-err .hub-title {
+  color: var(--wheel-err);
+}
+
+.hub-sub {
+  font-size: 9.5px;
+  font-weight: 500;
+  color: var(--wheel-sub);
+  max-width: 82px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  line-height: 1.2;
+}

@@ -36,7 +36,7 @@
       <div class="drawer-highlight-edge"></div>
 
       <!-- Left Song Meta & Cover -->
-      <div class="song-meta-section">
+      <div class="song-meta-section" title="点击跳转到 Folia 播放页">
         <div class="cover-container" id="coverContainer">
           <img id="coverImg" class="cover-image" src="" alt="Album Cover" />
           <div class="cover-fallback" id="coverFallback" aria-hidden="true">
@@ -54,7 +54,7 @@
       </div>
 
       <!-- Center Lyrics Display Area -->
-      <div class="lyrics-stage-section">
+      <div class="lyrics-stage-section" title="点击跳转到 Folia 播放页">
         <div class="lyrics-row primary-row">
           <div id="lyricMain" class="lyric-main">♪ 享受纯净旋律 ♪</div>
         </div>
@@ -77,6 +77,11 @@
 
         <!-- Action Buttons -->
         <div class="buttons-group">
+          <button id="likeBtn" class="action-btn like-btn" type="button" title="单击喜欢 / 悬停0.3秒或右键选择歌单" aria-label="喜欢或收藏到歌单">
+            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"></path>
+            </svg>
+          </button>
           <button id="prevBtn" class="action-btn" type="button" title="上一首">
             <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
               <polygon points="19 20 9 12 19 4 19 20"></polygon>

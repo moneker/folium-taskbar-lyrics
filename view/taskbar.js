@@ -18,9 +18,11 @@
   const drawerCoverBg = document.getElementById('drawerCoverBg');
   const coverImg = document.getElementById('coverImg');
   const coverFallback = document.getElementById('coverFallback');
+  const songMetaSection = document.querySelector('.song-meta-section');
   const songTitle = document.getElementById('songTitle');
   const songArtist = document.getElementById('songArtist');
   const lyricsStage = document.querySelector('.lyrics-stage-section');
+  const controlsSection = document.querySelector('.controls-section');
   const lyricMain = document.getElementById('lyricMain');
   const lyricSub = document.getElementById('lyricSub');
   const timeCurrent = document.getElementById('timeCurrent');
@@ -28,6 +30,7 @@
   const progressBar = document.getElementById('progressBar');
   const progressFill = document.getElementById('progressFill');
   const progressThumb = document.getElementById('progressThumb');
+  const likeBtn = document.getElementById('likeBtn');
   const prevBtn = document.getElementById('prevBtn');
   const playPauseBtn = document.getElementById('playPauseBtn');
   const nextBtn = document.getElementById('nextBtn');
@@ -36,9 +39,19 @@
   const menuBtn = document.getElementById('menuBtn');
 
   // Drawer & Hover State
+  const RIGHT_FADE_BUFFER_MS = 1500;
+  const RIGHT_RECOVER_ANIM_MS = 500;
+  const LIKE_WHEEL_HOVER_MS = 300;
   let isExpanded = false;
   let isAnimating = false;
   let isHoverHidden = false;
+  let hoverZonePhase = 'idle'; // 'idle' | 'right-fading' | 'right-locked'
+  let rightFadeTimer = null;
+  let rightRecoverTimer = null;
+  let likeWheelHoverTimer = null;
+  let isRadialOpen = false;
+  let isMenuOpen = false;
+  let isDraggingProgress = false;
   let animationSafetyTimer = null;
 
   function setAnimating(val) {
@@ -65,6 +78,8 @@
     updatedAt: Date.now(),
     lyrics: null,
     lyricsVisible: true,
+    liked: false,
+    canLike: false,
     lyricOffsetMs: 0,
     settings: {
       interactionMode: 'standard',
@@ -296,6 +311,7 @@
         bridge.notifyAnimationComplete('collapsed');
       } else if (appRoot.classList.contains('expanded')) {
         bridge.notifyAnimationComplete('expanded');
+        reportControlsRectNow();
       }
       syncRenderLoop();
     }
@@ -316,59 +332,359 @@
     bridge.toggleDrawer();
   }
 
-  // Hover-hide & Topmost pointer handlers
-  function handlePointerEnterOrMove() {
+  // Hover-hide 3-zone & Topmost pointer handlers
+  function getControlsLayoutRect() {
+    if (!controlsSection) return null;
+    // Use offset metrics relative to drawerPanel so CSS slide-in transforms never skew reported coordinates
+    const width = controlsSection.offsetWidth;
+    const height = controlsSection.offsetHeight;
+    if (width > 0 && height > 0) {
+      const panelOffsetLeft = drawerPanel ? drawerPanel.offsetLeft : 0;
+      const panelOffsetTop = drawerPanel ? drawerPanel.offsetTop : 0;
+      return {
+        x: Math.round(panelOffsetLeft + controlsSection.offsetLeft),
+        y: Math.round(panelOffsetTop + controlsSection.offsetTop),
+        width: Math.round(width),
+        height: Math.round(height),
+      };
+    }
+    const rect = controlsSection.getBoundingClientRect();
+    if (rect.width > 0 && rect.height > 0) {
+      return {
+        x: Math.round(rect.left),
+        y: Math.round(rect.top),
+        width: Math.round(rect.width),
+        height: Math.round(rect.height),
+      };
+    }
+    return null;
+  }
+
+  function reportControlsRectNow() {
+    if (typeof bridge.reportControlsRect !== 'function') return;
+    const rect = getControlsLayoutRect();
+    if (rect) {
+      bridge.reportControlsRect(rect);
+    }
+  }
+
+  function isEventInControls(e) {
+    if (!controlsSection) return false;
+    if (e && e.target instanceof Node && controlsSection.contains(e.target)) {
+      return true;
+    }
+    if (e && typeof e.clientX === 'number' && typeof e.clientY === 'number') {
+      const rect = getControlsLayoutRect();
+      if (!rect) return false;
+      const isVertical = appRoot.classList.contains('vertical-taskbar');
+      // Span full cross-axis height/width and extend to trailing edge so entering from desktop edge hits right zone
+      if (isVertical) {
+        return e.clientY >= rect.y - 8;
+      }
+      return e.clientX >= rect.x - 8;
+    }
+    return false;
+  }
+
+  function cancelLikeWheelHover() {
+    if (likeWheelHoverTimer) {
+      clearTimeout(likeWheelHoverTimer);
+      likeWheelHoverTimer = null;
+    }
+  }
+
+  function clearRightFadeTimer() {
+    if (rightFadeTimer) {
+      clearTimeout(rightFadeTimer);
+      rightFadeTimer = null;
+    }
+  }
+
+  function clearRightRecoverTimer() {
+    if (rightRecoverTimer) {
+      clearTimeout(rightRecoverTimer);
+      rightRecoverTimer = null;
+    }
+  }
+
+  function triggerSmoothRightRecover() {
+    const wasFading = appRoot.classList.contains('hover-fading-right');
+    appRoot.classList.remove('hover-fading-right');
+    if (wasFading && !isHoverHidden) {
+      appRoot.classList.add('hover-recovering-right');
+      clearRightRecoverTimer();
+      rightRecoverTimer = setTimeout(() => {
+        rightRecoverTimer = null;
+        appRoot.classList.remove('hover-recovering-right');
+      }, RIGHT_RECOVER_ANIM_MS);
+    }
+  }
+
+  function resetRightHoverState(notifyMain = false, smoothRecover = false) {
+    clearRightFadeTimer();
+    if (smoothRecover) {
+      triggerSmoothRightRecover();
+    } else {
+      clearRightRecoverTimer();
+      appRoot.classList.remove('hover-fading-right', 'hover-recovering-right');
+    }
+    hoverZonePhase = 'idle';
+    if (notifyMain && typeof bridge.notifyHoverZoneState === 'function') {
+      bridge.notifyHoverZoneState('idle');
+    }
+  }
+
+  function lockRightControlsZone(state = 'right-locked') {
+    clearRightFadeTimer();
+    triggerSmoothRightRecover();
     if (snapshot.settings?.interactionMode === 'hover-hide') {
-      if (!isHoverHidden && typeof bridge.notifyHoverEnter === 'function') {
-        bridge.notifyHoverEnter();
+      hoverZonePhase = state;
+      if (typeof bridge.notifyHoverZoneState === 'function') {
+        bridge.notifyHoverZoneState(state);
+      }
+    }
+  }
+
+  function startRightFadeBuffer() {
+    if (snapshot.settings?.interactionMode !== 'hover-hide' || isHoverHidden) return;
+    if (hoverZonePhase !== 'idle' || isRadialOpen || isMenuOpen || isDraggingProgress) return;
+    clearRightRecoverTimer();
+    appRoot.classList.remove('hover-recovering-right');
+    hoverZonePhase = 'right-fading';
+    appRoot.classList.add('hover-fading-right');
+    if (typeof bridge.notifyHoverZoneState === 'function') {
+      bridge.notifyHoverZoneState('right-fading');
+    }
+    clearRightFadeTimer();
+    rightFadeTimer = setTimeout(() => {
+      rightFadeTimer = null;
+      if (
+        snapshot.settings?.interactionMode === 'hover-hide'
+        && hoverZonePhase === 'right-fading'
+        && !isHoverHidden
+        && !isRadialOpen
+        && !isMenuOpen
+        && !isDraggingProgress
+      ) {
+        // Keep .hover-fading-right until onHoverHidden(true) arrives so opacity never bounces upward
+        hoverZonePhase = 'idle';
+        cancelLikeWheelHover();
+        if (typeof bridge.notifyHoverEnter === 'function') {
+          bridge.notifyHoverEnter();
+        }
+      }
+    }, RIGHT_FADE_BUFFER_MS);
+  }
+
+  function handleHoverMoveInMode(e, isEnter = false) {
+    if (snapshot.settings?.interactionMode !== 'hover-hide') {
+      if (isEnter) bridge.assertTop();
+      return;
+    }
+    if (isHoverHidden) return;
+    if (isEventInControls(e)) {
+      if (hoverZonePhase === 'idle' && !isRadialOpen && !isMenuOpen && !isDraggingProgress) {
+        startRightFadeBuffer();
+      }
+      return;
+    }
+    if (isRadialOpen || isMenuOpen || isDraggingProgress) return;
+    resetRightHoverState(true);
+    cancelLikeWheelHover();
+    if (typeof bridge.notifyHoverEnter === 'function') {
+      bridge.notifyHoverEnter();
+    }
+  }
+
+  appRoot.addEventListener('pointerdown', (e) => {
+    if (snapshot.settings?.interactionMode === 'hover-hide') {
+      if (isDraggingProgress) {
+        bridge.assertTop();
+        return;
+      }
+      if (isEventInControls(e)) {
+        lockRightControlsZone();
+        bridge.assertTop();
+        return;
+      }
+      if (!isRadialOpen && !isMenuOpen && !isDraggingProgress) {
+        resetRightHoverState(true);
+        cancelLikeWheelHover();
+        if (typeof bridge.notifyHoverEnter === 'function') bridge.notifyHoverEnter();
       }
       return;
     }
     bridge.assertTop();
-  }
-
-  appRoot.addEventListener('pointerdown', () => {
-    if (snapshot.settings?.interactionMode === 'hover-hide') {
-      if (typeof bridge.notifyHoverEnter === 'function') bridge.notifyHoverEnter();
-      return;
-    }
-    bridge.assertTop();
   });
-  appRoot.addEventListener('pointerenter', handlePointerEnterOrMove);
-  appRoot.addEventListener('mousemove', () => {
-    if (snapshot.settings?.interactionMode === 'hover-hide' && !isHoverHidden) {
-      if (typeof bridge.notifyHoverEnter === 'function') bridge.notifyHoverEnter();
+  appRoot.addEventListener('pointerenter', (e) => handleHoverMoveInMode(e, true));
+  appRoot.addEventListener('mousemove', (e) => handleHoverMoveInMode(e, false));
+  appRoot.addEventListener('mouseleave', () => {
+    if (snapshot.settings?.interactionMode === 'hover-hide' && !isHoverHidden && !isRadialOpen && !isMenuOpen && !isDraggingProgress) {
+      resetRightHoverState(true, true);
     }
+  });
+  window.addEventListener('resize', () => {
+    reportControlsRectNow();
   });
 
   if (typeof bridge.onHoverHidden === 'function') {
     bridge.onHoverHidden((hidden) => {
       isHoverHidden = Boolean(hidden);
+      resetRightHoverState(false);
+      cancelLikeWheelHover();
+      if (isHoverHidden) {
+        isRadialOpen = false;
+        isMenuOpen = false;
+        isDraggingProgress = false;
+      }
       appRoot.classList.toggle('hover-hidden', isHoverHidden);
       if (!isHoverHidden) {
         renderSingleFrame();
+        reportControlsRectNow();
       }
       syncRenderLoop();
     });
   }
 
+  if (typeof bridge.onHoverZoneReset === 'function') {
+    bridge.onHoverZoneReset(() => {
+      if (!isMenuOpen && !isRadialOpen && !isDraggingProgress) {
+        resetRightHoverState(false, true);
+      }
+    });
+  }
+
+  if (typeof bridge.onMenuState === 'function') {
+    bridge.onMenuState((open) => {
+      isMenuOpen = Boolean(open);
+      if (isMenuOpen) {
+        lockRightControlsZone('right-locked');
+      }
+    });
+  }
+
+  if (typeof bridge.onRadialClosed === 'function') {
+    bridge.onRadialClosed(() => {
+      isRadialOpen = false;
+    });
+  }
+
   toggleBtn.addEventListener('click', handleToggleTrigger);
 
+  // Click lyrics or song meta to jump to Folia player page (in non-hover-hide mode)
+  function handleJumpToPlayerPage(e) {
+    if (snapshot.settings?.interactionMode === 'hover-hide') return;
+    if (e) {
+      e.stopPropagation();
+    }
+    if (typeof bridge.openPlayerPage === 'function') {
+      bridge.openPlayerPage();
+    }
+  }
+
+  if (lyricsStage) {
+    lyricsStage.addEventListener('click', handleJumpToPlayerPage);
+  }
+  if (songMetaSection) {
+    songMetaSection.addEventListener('click', handleJumpToPlayerPage);
+  }
+
+  // Like button: single click toggles like; hover 0.5s or right-click opens semicircle radial playlist wheel
+  function openLikeRadialWheel() {
+    if (!likeBtn || !snapshot.song || typeof bridge.openRadialWheel !== 'function') return;
+    lockRightControlsZone();
+    isRadialOpen = true;
+    const rect = likeBtn.getBoundingClientRect();
+    bridge.openRadialWheel({
+      x: Math.round(rect.left),
+      y: Math.round(rect.top),
+      width: Math.round(rect.width),
+      height: Math.round(rect.height),
+    });
+  }
+
+  function updateLikeButton() {
+    if (!likeBtn) return;
+    const hasSong = Boolean(snapshot.song);
+    const liked = Boolean(snapshot.liked);
+    const canLike = Boolean(snapshot.canLike);
+    likeBtn.disabled = !hasSong;
+    likeBtn.classList.toggle('liked', liked && canLike);
+    likeBtn.classList.toggle('like-unavailable', hasSong && !canLike);
+    likeBtn.setAttribute('aria-pressed', String(liked && canLike));
+    if (!hasSong) {
+      likeBtn.title = '暂无正在播放的曲目';
+    } else if (!canLike) {
+      likeBtn.title = '悬停0.3秒或右键选择收藏歌单';
+    } else {
+      likeBtn.title = liked
+        ? '单击取消喜欢 / 悬停0.3秒或右键选择歌单'
+        : '单击喜欢 / 悬停0.3秒或右键选择歌单';
+    }
+  }
+
+  if (likeBtn) {
+    likeBtn.addEventListener('pointerenter', () => {
+      if (!snapshot.song) return;
+      cancelLikeWheelHover();
+      likeWheelHoverTimer = setTimeout(() => {
+        likeWheelHoverTimer = null;
+        openLikeRadialWheel();
+      }, LIKE_WHEEL_HOVER_MS);
+    });
+
+    likeBtn.addEventListener('pointerleave', () => {
+      cancelLikeWheelHover();
+      if (isRadialOpen && typeof bridge.notifyRadialAnchorLeave === 'function') {
+        bridge.notifyRadialAnchorLeave();
+      }
+    });
+
+    likeBtn.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      cancelLikeWheelHover();
+      openLikeRadialWheel();
+    });
+
+    likeBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      cancelLikeWheelHover();
+      lockRightControlsZone();
+      if (isRadialOpen && typeof bridge.closeRadialWheel === 'function') {
+        isRadialOpen = false;
+        bridge.closeRadialWheel();
+      }
+      if (snapshot.canLike) {
+        bridge.sendPlaybackAction('toggleLike');
+      }
+    });
+  }
+
   // Playback Control Buttons
-  prevBtn.addEventListener('click', () => bridge.sendPlaybackAction('prev'));
-  nextBtn.addEventListener('click', () => bridge.sendPlaybackAction('next'));
-  playPauseBtn.addEventListener('click', () => bridge.sendPlaybackAction('toggle'));
+  prevBtn.addEventListener('click', () => {
+    lockRightControlsZone();
+    bridge.sendPlaybackAction('prev');
+  });
+  nextBtn.addEventListener('click', () => {
+    lockRightControlsZone();
+    bridge.sendPlaybackAction('next');
+  });
+  playPauseBtn.addEventListener('click', () => {
+    lockRightControlsZone();
+    bridge.sendPlaybackAction('toggle');
+  });
 
   // Menu button click
   if (menuBtn) {
     menuBtn.addEventListener('click', (e) => {
       e.stopPropagation();
+      lockRightControlsZone();
       bridge.toggleMenu();
     });
   }
 
   // Interactive Progress Bar Dragging & Seeking
-  let isDraggingProgress = false;
   let seekCooldownUntil = 0;
 
   function updateSeekDisplay(ratio) {
@@ -403,9 +719,15 @@
   }
 
   progressBar.addEventListener('pointerdown', (e) => {
-    if (!snapshot.duration || snapshot.duration <= 0) return;
+    e.stopPropagation();
+    bridge.assertTop();
+    if (!snapshot.duration || snapshot.duration <= 0) {
+      lockRightControlsZone('right-locked');
+      return;
+    }
     e.preventDefault();
     isDraggingProgress = true;
+    lockRightControlsZone('right-dragging');
     try { progressBar.setPointerCapture(e.pointerId); } catch {}
     const ratio = getRatioFromEvent(e);
     updateSeekDisplay(ratio);
@@ -421,6 +743,7 @@
   const finishSeek = (e) => {
     if (!isDraggingProgress) return;
     isDraggingProgress = false;
+    lockRightControlsZone('right-locked');
     try { progressBar.releasePointerCapture(e.pointerId); } catch {}
     const ratio = getRatioFromEvent(e);
     const targetTime = updateSeekDisplay(ratio);
@@ -448,6 +771,9 @@
   bridge.onDrawerState((state) => {
     setAnimating(false);
     setDrawerExpanded(state === 'expanded');
+    if (state === 'expanded') {
+      requestAnimationFrame(() => reportControlsRectNow());
+    }
   });
 
   const CJK_REGEX = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff66-\uff9f\uac00-\ud7af]/;
@@ -675,6 +1001,12 @@
       }
       snapshot.lyricsVisible = nextVisible;
     }
+    if (data.liked !== undefined) {
+      snapshot.liked = Boolean(data.liked);
+    }
+    if (data.canLike !== undefined) {
+      snapshot.canLike = Boolean(data.canLike);
+    }
     snapshot.currentTime = nextCurrentTime;
     snapshot.updatedAt = nextUpdatedAt;
     snapshot.lyrics = nextLyrics;
@@ -686,6 +1018,7 @@
       appRoot.classList.toggle('vertical-taskbar', isVertical);
       appRoot.classList.toggle('edge-left', edge === 'left');
       appRoot.classList.toggle('edge-right', edge === 'right');
+      requestAnimationFrame(() => reportControlsRectNow());
     }
 
     if (data.settings) {
@@ -700,6 +1033,15 @@
       }
       const isHoverMode = snapshot.settings.interactionMode === 'hover-hide';
       appRoot.classList.toggle('hover-hide-mode', isHoverMode);
+      if (!isHoverMode) {
+        resetRightHoverState(false);
+      }
+      if (lyricsStage) {
+        lyricsStage.title = isHoverMode ? '' : '点击跳转到 Folia 播放页';
+      }
+      if (songMetaSection) {
+        songMetaSection.title = isHoverMode ? '' : '点击跳转到 Folia 播放页';
+      }
     }
 
     if (lyricsVisibilityChanged) {
@@ -712,6 +1054,9 @@
 
     if (data.song !== undefined || data.duration !== undefined || data.lyrics !== undefined || data.settings !== undefined || lyricsVisibilityChanged) {
       updateMetadata();
+    }
+    if (data.song !== undefined || data.liked !== undefined || data.canLike !== undefined) {
+      updateLikeButton();
     }
     if (data.playerState !== undefined) {
       updatePlayerState();

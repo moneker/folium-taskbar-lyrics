@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Folia Taskbar Like Wheel</title>
+  <link rel="stylesheet" href="radial.css">
+</head>
+<body>
+  <!-- mods/taskbar-lyrics/view/radial.html: Rotary cover-art semicircle radial playlist wheel anchored above the taskbar like button -->
+  <div id="radialRoot" class="radial-root placement-top">
+    <svg id="wheelSvg" class="wheel-svg" viewBox="0 0 328 196" width="328" height="196" aria-label="选择收藏位置"></svg>
+    <div id="hubControls" class="hub-controls">
+      <button id="rotPrevBtn" class="rot-btn hidden" type="button" title="向左旋转查看更多歌单" aria-label="向左旋转">
+        <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="15 18 9 12 15 6"></polyline>
+        </svg>
+      </button>
+      <div id="hubBadge" class="hub-badge">
+        <div id="hubTitle" class="hub-title">选择收藏</div>
+        <div id="hubSub" class="hub-sub">点击加入歌单</div>
+      </div>
+      <button id="rotNextBtn" class="rot-btn hidden" type="button" title="向右旋转查看更多歌单" aria-label="向右旋转">
+        <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="9 18 15 12 9 6"></polyline>
+        </svg>
+      </button>
+    </div>
+  </div>
+  <script src="radial.js"></script>
+</body>
+</html>

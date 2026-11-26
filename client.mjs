@@ -177,6 +177,11 @@ export default function activate(folium) {
   // In-memory raw item caches kept exclusively in client.mjs to avoid cloning large rawSong/rawCollection
   // graphs across IPC into main process, taskbarWindow, and menuWindow.
   const cachedCollectionMap = new Map();
+  const cachedWheelPlaylistMap = new Map();
+  const playlistMembershipCache = new Map(); // `${providerId}:${id}` -> { ids: Set<string>, trackCount: number, fetchedAt: number, complete: boolean }
+  const MEMBERSHIP_CACHE_TTL_MS = 10 * 60 * 1000;
+  let radialFetchSeq = 0;
+  let radialSelectSeq = 0;
   let cachedDetailRawSongs = [];
   let cachedLocalPageRawSongs = [];
   let cachedDailyRawSongs = [];
@@ -191,6 +196,8 @@ export default function activate(folium) {
     updatedAt: Date.now(),
     lyrics: null,
     lyricsVisible: true,
+    liked: false,
+    canLike: false,
     queue: [],
     queueTotal: 0,
     queuePage: 0,
@@ -640,6 +647,12 @@ export default function activate(folium) {
             coverUrl: currentSnapshot.song?.coverUrl || null,
           };
         }
+        if (typeof state.liked === 'boolean') {
+          currentSnapshot.liked = state.liked;
+        }
+        if (typeof state.canLike === 'boolean') {
+          currentSnapshot.canLike = state.canLike;
+        }
         const clock = samplePlaybackClock();
         currentSnapshot.playerState = clock.state;
         currentSnapshot.isAdvancing = clock.isAdvancing;
@@ -650,6 +663,506 @@ export default function activate(folium) {
       syncPlaybackStoreLyricsAndSong();
     } catch {
       // Ignored
+    }
+  }
+
+  function getCurrentRawSong() {
+    try {
+      const pState = tryGetInternalStores()?.playback?.getState?.();
+      return pState?.transitionDisplay?.song || pState?.currentSong || null;
+    } catch {
+      return null;
+    }
+  }
+
+  function getCurrentSongIdentityKey() {
+    const rawSong = getCurrentRawSong();
+    if (rawSong) {
+      const ref = rawSong.sourceRef;
+      if (ref?.kind === 'online') return `online:${ref.providerId || ''}:${ref.mediaId ?? rawSong.id ?? ''}`;
+      if (ref?.kind) return `${ref.kind}:${ref.mediaId ?? rawSong.id ?? ''}`;
+      return `${rawSong.providerId || ''}:${rawSong.id ?? rawSong.name ?? ''}`;
+    }
+    if (currentSnapshot.song) {
+      return `snap:${currentSnapshot.song.title || ''}:${currentSnapshot.song.artist || ''}`;
+    }
+    return '';
+  }
+
+  function refreshLikeStateFromHost() {
+    let hasLiked = false;
+    let hasCanLike = false;
+    try {
+      const state = folium.playback.getState();
+      if (state) {
+        if (typeof state.liked === 'boolean') {
+          currentSnapshot.liked = state.liked;
+          hasLiked = true;
+        }
+        if (typeof state.canLike === 'boolean') {
+          currentSnapshot.canLike = state.canLike;
+          hasCanLike = true;
+        }
+      }
+    } catch {}
+    if (hasLiked && hasCanLike) return;
+    if (!hasCanLike) {
+      const rawSong = getCurrentRawSong();
+      const omni = getLegacyInternalOmni();
+      currentSnapshot.canLike = Boolean(rawSong && omni?.canLikeSong?.(rawSong));
+    }
+  }
+
+  function reconcileLikeStateIfChanged() {
+    const prevLiked = Boolean(currentSnapshot.liked);
+    const prevCanLike = Boolean(currentSnapshot.canLike);
+    refreshLikeStateFromHost();
+    if (Boolean(currentSnapshot.liked) !== prevLiked || Boolean(currentSnapshot.canLike) !== prevCanLike) {
+      void pushSnapshot({
+        liked: currentSnapshot.liked,
+        canLike: currentSnapshot.canLike,
+      });
+    }
+  }
+
+  function resolveSongProviderId(rawSong, hostSong) {
+    if (rawSong?.sourceRef?.kind === 'online' && rawSong.sourceRef.providerId) {
+      return rawSong.sourceRef.providerId;
+    }
+    if (typeof rawSong?.providerId === 'string' && rawSong.providerId) {
+      return rawSong.providerId;
+    }
+    if (typeof hostSong?.source === 'string' && hostSong.source && hostSong.source !== 'local' && hostSong.source !== 'navidrome' && hostSong.source !== 'stage') {
+      return hostSong.source;
+    }
+    return null;
+  }
+
+  function getSongMatchKeys(song) {
+    const keys = new Set();
+    if (!song || typeof song !== 'object') return keys;
+    const addKey = (val) => {
+      if (val !== undefined && val !== null && val !== '') {
+        keys.add(String(val));
+      }
+    };
+    addKey(song.id);
+    addKey(song.sourceRef?.mediaId);
+    addKey(song.hash);
+    addKey(song.mid);
+    addKey(song.songmid);
+    addKey(song.emixsongid);
+    return keys;
+  }
+
+  function makeMembershipCacheKey(providerId, playlistId) {
+    return `${providerId || 'online'}:${String(playlistId ?? '')}`;
+  }
+
+  function songMatchesTrackIdSet(matchKeys, idSet) {
+    if (!matchKeys || matchKeys.size === 0 || !idSet || idSet.size === 0) return false;
+    for (const key of matchKeys) {
+      if (idSet.has(key)) return true;
+    }
+    return false;
+  }
+
+  function recordSongInMembershipCache(providerId, playlistId, song, trackCount = 0) {
+    const cacheKey = makeMembershipCacheKey(providerId, playlistId);
+    const matchKeys = getSongMatchKeys(song);
+    if (matchKeys.size === 0) return;
+    let entry = playlistMembershipCache.get(cacheKey);
+    if (!entry) {
+      entry = { ids: new Set(), trackCount: Number(trackCount) || 0, fetchedAt: Date.now(), complete: false };
+      playlistMembershipCache.set(cacheKey, entry);
+    }
+    matchKeys.forEach((k) => entry.ids.add(k));
+    if (trackCount > entry.trackCount) {
+      entry.trackCount = trackCount;
+    }
+    entry.fetchedAt = Date.now();
+  }
+
+  function removeSongFromMembershipCache(providerId, playlistId, song) {
+    const cacheKey = makeMembershipCacheKey(providerId, playlistId);
+    const entry = playlistMembershipCache.get(cacheKey);
+    if (!entry) return;
+    const matchKeys = getSongMatchKeys(song);
+    let removed = false;
+    matchKeys.forEach((k) => {
+      if (entry.ids.delete(k)) removed = true;
+    });
+    if (removed && entry.trackCount > 0) {
+      entry.trackCount = Math.max(0, entry.trackCount - 1);
+    }
+    entry.fetchedAt = Date.now();
+  }
+
+  function isMembershipCacheFresh(entry, expectedTrackCount) {
+    if (!entry || !entry.complete) return false;
+    if (Date.now() - entry.fetchedAt > MEMBERSHIP_CACHE_TTL_MS) return false;
+    const expected = Number(expectedTrackCount) || 0;
+    if (expected > 0 && entry.trackCount > 0 && expected !== entry.trackCount) return false;
+    return true;
+  }
+
+  async function hydrateWheelPlaylistMembership(reqSeq, initialSongKey, matchKeys, playlistsToCheck, baseTargets) {
+    const omni = getLegacyInternalOmni();
+    if (!omni || typeof omni.getCollectionTracks !== 'function' || matchKeys.size === 0) return;
+
+    // Prioritize first 12 playlists and cap per-playlist scan at 5 pages (500 tracks) to avoid rate limits
+    const candidates = playlistsToCheck.slice(0, 12);
+    const maxPagesPerPlaylist = 5;
+    const pageSize = 100;
+    const concurrency = 2;
+    let cursor = 0;
+
+    const currentTargets = baseTargets.map((t) => ({ ...t }));
+    const targetById = new Map(currentTargets.map((t) => [String(t.id), t]));
+
+    const scanOne = async (collection) => {
+      if (isDisposed || reqSeq !== radialFetchSeq || getCurrentSongIdentityKey() !== initialSongKey) return;
+      const cacheKey = makeMembershipCacheKey(collection.providerId, collection.id);
+      const expectedCount = Number(collection.trackCount ?? collection.songCount ?? 0) || 0;
+      const existing = playlistMembershipCache.get(cacheKey);
+      if (isMembershipCacheFresh(existing, expectedCount)) return;
+
+      const ids = existing ? new Set(existing.ids) : new Set();
+      let offset = 0;
+      let complete = true;
+
+      for (let pageIdx = 0; pageIdx < maxPagesPerPlaylist; pageIdx++) {
+        if (isDisposed || reqSeq !== radialFetchSeq || getCurrentSongIdentityKey() !== initialSongKey) return;
+        let page;
+        try {
+          page = await omni.getCollectionTracks(collection, { limit: pageSize, offset });
+        } catch {
+          complete = false;
+          break;
+        }
+        const items = Array.isArray(page?.items) ? page.items : [];
+        for (const item of items) {
+          getSongMatchKeys(item).forEach((k) => ids.add(k));
+        }
+        const reportedMore = typeof page?.hasMore === 'boolean' ? page.hasMore : items.length >= pageSize;
+        if (!reportedMore || items.length === 0) {
+          break;
+        }
+        if (pageIdx === maxPagesPerPlaylist - 1) {
+          complete = false;
+        }
+        offset = (typeof page?.nextOffset === 'number' && page.nextOffset > offset)
+          ? page.nextOffset
+          : (offset + items.length);
+      }
+
+      playlistMembershipCache.set(cacheKey, {
+        ids,
+        trackCount: expectedCount || ids.size,
+        fetchedAt: Date.now(),
+        complete,
+      });
+
+      if (isDisposed || reqSeq !== radialFetchSeq || getCurrentSongIdentityKey() !== initialSongKey) return;
+      const inPlaylist = songMatchesTrackIdSet(matchKeys, ids);
+      const targetDto = targetById.get(String(collection.id));
+      if (targetDto && Boolean(targetDto.inPlaylist) !== inPlaylist) {
+        targetDto.inPlaylist = inPlaylist;
+        void pushSnapshot({
+          liked: currentSnapshot.liked,
+          canLike: currentSnapshot.canLike,
+          radialTargets: currentTargets.map((t) => ({ ...t })),
+        });
+      }
+    };
+
+    const workers = Array.from({ length: Math.min(concurrency, candidates.length) }, async () => {
+      while (cursor < candidates.length) {
+        if (isDisposed || reqSeq !== radialFetchSeq || getCurrentSongIdentityKey() !== initialSongKey) return;
+        const item = candidates[cursor++];
+        await scanOne(item);
+      }
+    });
+
+    await Promise.all(workers);
+  }
+
+  /**
+   * Builds the radial wheel target list for the currently playing song:
+   * slot 0 is always "我喜欢的音乐" (toggle like), followed by up to 36 writable online playlists
+   * belonging to the song's signed-in platform, with membership highlight for already-collected playlists.
+   */
+  async function buildRadialWheelTargets() {
+    const reqSeq = ++radialFetchSeq;
+    const initialSongKey = getCurrentSongIdentityKey();
+    refreshLikeStateFromHost();
+
+    const hostState = (() => {
+      try { return folium.playback.getState(); } catch { return null; }
+    })();
+    const rawSong = getCurrentRawSong();
+    const hasSong = Boolean(hostState?.song || rawSong || currentSnapshot.song);
+    if (!hasSong) {
+      cachedWheelPlaylistMap.clear();
+      return { stale: false, targets: [] };
+    }
+
+    const liked = Boolean(currentSnapshot.liked);
+    const canLike = Boolean(currentSnapshot.canLike);
+    const omni = getLegacyInternalOmni();
+    const matchKeys = getSongMatchKeys(rawSong || hostState?.song);
+    let likedCoverUrl = currentSnapshot.song?.coverUrl || '';
+    const maxPlaylists = 36;
+    const seenIds = new Set();
+    const nextPlaylistMap = new Map();
+    const playlistTargets = [];
+    const playlistsNeedingScan = [];
+
+    const pushPlaylistCandidate = (collection) => {
+      if (!collection || playlistTargets.length >= maxPlaylists) return;
+      const id = String(collection.id ?? '');
+      if (!id || seenIds.has(id)) return;
+      if (collection.isLiked) {
+        if (!likedCoverUrl && (collection.coverUrl || collection.picUrl)) {
+          likedCoverUrl = collection.coverUrl || collection.picUrl || '';
+        }
+        if (canLike) return;
+      }
+      seenIds.add(id);
+      nextPlaylistMap.set(id, collection);
+      const name = String(collection.name || '自建歌单').trim();
+      const trackCount = Number(collection.trackCount ?? collection.songCount ?? 0) || 0;
+      const cacheKey = makeMembershipCacheKey(collection.providerId, id);
+      const cached = playlistMembershipCache.get(cacheKey);
+      const inPlaylist = Boolean(cached && songMatchesTrackIdSet(matchKeys, cached.ids));
+      if (!isMembershipCacheFresh(cached, trackCount)) {
+        playlistsNeedingScan.push(collection);
+      }
+      const canRemove = Boolean(
+        typeof omni?.updateCollectionTracks === 'function'
+        && (typeof omni?.canEditCollectionTracks !== 'function' || omni.canEditCollectionTracks(collection)),
+      );
+      playlistTargets.push({
+        id,
+        kind: 'playlist',
+        name,
+        shortName: name,
+        coverUrl: collection.coverUrl || collection.picUrl || '',
+        providerId: collection.providerId || null,
+        trackCount,
+        inPlaylist,
+        canRemove,
+        disabled: false,
+      });
+    };
+
+    if (rawSong && omni && typeof omni.canAddSongToPlaylist === 'function' && omni.canAddSongToPlaylist(rawSong)) {
+      if (typeof omni.getPlaylistsForSong === 'function') {
+        try {
+          const directPlaylists = omni.getPlaylistsForSong(rawSong) || [];
+          for (const pl of directPlaylists) {
+            if (pl?.type === 'playlist') {
+              pushPlaylistCandidate(pl);
+            }
+          }
+        } catch (err) {
+          folium.log.warn('Failed to read omni.getPlaylistsForSong for radial wheel', err);
+        }
+      } else if (typeof omni.getProviderSummaries === 'function') {
+        // Older host fallback: only read currently signed-in provider summaries with writable playlists
+        try {
+          const providerId = resolveSongProviderId(rawSong, hostState?.song);
+          const summaries = omni.getProviderSummaries() || [];
+          const summary = summaries.find((s) => s && s.providerId === providerId && s.user?.id);
+          if (summary && Array.isArray(summary.collections)) {
+            for (const c of summary.collections) {
+              if (c?.type === 'playlist' && c.canAddToPlaylist !== false) {
+                pushPlaylistCandidate(c);
+              }
+            }
+          }
+        } catch (err) {
+          folium.log.warn('Failed to read signed-in provider summaries for radial wheel', err);
+        }
+      }
+    }
+
+    const targets = [
+      {
+        id: '__liked__',
+        kind: 'like',
+        name: liked ? '取消喜欢' : '我喜欢的音乐',
+        shortName: liked ? '取消喜欢' : '我喜欢',
+        coverUrl: likedCoverUrl,
+        liked,
+        canLike,
+        disabled: !canLike,
+      },
+      ...playlistTargets,
+    ];
+
+    if (isDisposed || reqSeq !== radialFetchSeq || getCurrentSongIdentityKey() !== initialSongKey) {
+      return { stale: true, targets: [] };
+    }
+
+    cachedWheelPlaylistMap.clear();
+    nextPlaylistMap.forEach((value, key) => cachedWheelPlaylistMap.set(key, value));
+
+    const startHydration = (playlistsNeedingScan.length > 0 && matchKeys.size > 0)
+      ? () => {
+          void hydrateWheelPlaylistMembership(reqSeq, initialSongKey, matchKeys, playlistsNeedingScan, targets);
+        }
+      : null;
+
+    return { stale: false, targets, startHydration };
+  }
+
+  async function toggleCurrentSongLike() {
+    refreshLikeStateFromHost();
+    const prevLiked = Boolean(currentSnapshot.liked);
+    if (typeof folium.playback?.toggleLike === 'function') {
+      try {
+        const acted = folium.playback.toggleLike();
+        if (acted) {
+          // Read host state immediately if updated synchronously; otherwise reconcile via event & 200ms poll
+          refreshLikeStateFromHost();
+          const nextLiked = currentSnapshot.liked !== prevLiked ? Boolean(currentSnapshot.liked) : !prevLiked;
+          currentSnapshot.liked = nextLiked;
+          void pushSnapshot({ liked: nextLiked, canLike: currentSnapshot.canLike });
+          return { ok: true, liked: nextLiked, message: nextLiked ? '已加入我喜欢' : '已取消喜欢' };
+        }
+      } catch (err) {
+        folium.log.warn('folium.playback.toggleLike failed', err);
+      }
+    }
+
+    const rawSong = getCurrentRawSong();
+    const omni = getLegacyInternalOmni();
+    if (rawSong && omni && typeof omni.toggleSongLike === 'function') {
+      try {
+        const nextLiked = await omni.toggleSongLike(rawSong);
+        currentSnapshot.liked = Boolean(nextLiked);
+        void pushSnapshot({ liked: currentSnapshot.liked, canLike: currentSnapshot.canLike });
+        return { ok: true, liked: currentSnapshot.liked, message: currentSnapshot.liked ? '已加入我喜欢' : '已取消喜欢' };
+      } catch (err) {
+        folium.log.warn('omni.toggleSongLike failed', err);
+        return { ok: false, message: err?.message || '喜欢操作失败' };
+      }
+    }
+
+    return { ok: false, message: '当前歌曲不支持喜欢操作' };
+  }
+
+  async function handleRadialTargetSelection(target) {
+    if (!target || typeof target !== 'object') return;
+    const selectSeq = ++radialSelectSeq;
+    const initialSongKey = getCurrentSongIdentityKey();
+
+    if (target.kind === 'like' || target.id === '__liked__') {
+      const res = await toggleCurrentSongLike();
+      if (isDisposed || selectSeq !== radialSelectSeq) {
+        return;
+      }
+      const sameSong = getCurrentSongIdentityKey() === initialSongKey;
+      void pushSnapshot({
+        ...(sameSong ? { liked: currentSnapshot.liked, canLike: currentSnapshot.canLike } : {}),
+        radialFeedback: {
+          ok: Boolean(res.ok),
+          targetId: '__liked__',
+          message: res.message || (res.ok ? '操作成功' : '操作失败'),
+        },
+      });
+      return;
+    }
+
+    const rawSong = getCurrentRawSong();
+    const omni = getLegacyInternalOmni();
+    const targetId = String(target.id ?? '');
+    const playlist = cachedWheelPlaylistMap.get(targetId);
+
+    if (!rawSong || !playlist || !omni) {
+      const message = '当前歌曲无法操作该歌单';
+      try { folium.ui?.toast?.(message, { type: 'error', durationMs: 2200 }); } catch {}
+      void pushSnapshot({
+        radialFeedback: { ok: false, targetId, message },
+      });
+      return;
+    }
+
+    const memKey = makeMembershipCacheKey(playlist.providerId, playlist.id);
+    const cachedMem = playlistMembershipCache.get(memKey);
+    const isAlreadyInPlaylist = Boolean(
+      target.inPlaylist
+      || (cachedMem && songMatchesTrackIdSet(getSongMatchKeys(rawSong), cachedMem.ids)),
+    );
+
+    if (isAlreadyInPlaylist) {
+      const canRemove = Boolean(
+        typeof omni.updateCollectionTracks === 'function'
+        && (typeof omni.canEditCollectionTracks !== 'function' || omni.canEditCollectionTracks(playlist)),
+      );
+      if (!canRemove) {
+        const message = '该歌单不支持移出歌曲';
+        try { folium.ui?.toast?.(message, { type: 'error', durationMs: 2200 }); } catch {}
+        void pushSnapshot({
+          radialFeedback: { ok: false, targetId, message },
+        });
+        return;
+      }
+      try {
+        await omni.updateCollectionTracks(playlist, 'del', [rawSong]);
+        removeSongFromMembershipCache(playlist.providerId, playlist.id, rawSong);
+        if (typeof omni.refreshProviderPlaylists === 'function' && playlist.providerId) {
+          void omni.refreshProviderPlaylists(playlist.providerId).catch(() => {});
+        }
+        const message = `已从「${playlist.name || '歌单'}」移出`;
+        try { folium.ui?.toast?.(message, { type: 'success', durationMs: 2200 }); } catch {}
+        if (!isDisposed && selectSeq === radialSelectSeq) {
+          void pushSnapshot({
+            radialFeedback: { ok: true, removed: true, targetId, message },
+          });
+        }
+      } catch (err) {
+        folium.log.warn('Failed to remove current song from playlist via radial wheel', err);
+        const message = err?.message || '移出歌单失败';
+        try { folium.ui?.toast?.(message, { type: 'error', durationMs: 2600 }); } catch {}
+        if (!isDisposed && selectSeq === radialSelectSeq) {
+          void pushSnapshot({
+            radialFeedback: { ok: false, targetId, message },
+          });
+        }
+      }
+      return;
+    }
+
+    if (typeof omni.addSongToPlaylist !== 'function') {
+      const message = '当前歌曲无法加入该歌单';
+      try { folium.ui?.toast?.(message, { type: 'error', durationMs: 2200 }); } catch {}
+      void pushSnapshot({
+        radialFeedback: { ok: false, targetId, message },
+      });
+      return;
+    }
+
+    try {
+      await omni.addSongToPlaylist(rawSong, playlist);
+      recordSongInMembershipCache(playlist.providerId, playlist.id, rawSong, (Number(playlist.trackCount) || 0) + 1);
+      const message = `已加入「${playlist.name || '歌单'}」`;
+      try { folium.ui?.toast?.(message, { type: 'success', durationMs: 2200 }); } catch {}
+      if (!isDisposed && selectSeq === radialSelectSeq) {
+        void pushSnapshot({
+          radialFeedback: { ok: true, removed: false, targetId, message },
+        });
+      }
+    } catch (err) {
+      folium.log.warn('Failed to add current song to playlist from radial wheel', err);
+      const message = err?.message || '加入歌单失败';
+      try { folium.ui?.toast?.(message, { type: 'error', durationMs: 2600 }); } catch {}
+      if (!isDisposed && selectSeq === radialSelectSeq) {
+        void pushSnapshot({
+          radialFeedback: { ok: false, targetId, message },
+        });
+      }
     }
   }
 
@@ -1340,6 +1853,19 @@ export default function activate(folium) {
 
         if (!reqId || reqId === activePlaylistDetailRequestId) {
           cachedDetailRawSongs = allRawSongs;
+        }
+        // Seed membership cache for free whenever user browses an online playlist in the menu
+        if (collection.type === 'playlist' && allRawSongs.length > 0) {
+          const ids = new Set();
+          allRawSongs.forEach((entry) => {
+            getSongMatchKeys(entry.rawSong || entry).forEach((k) => ids.add(k));
+          });
+          playlistMembershipCache.set(makeMembershipCacheKey(collection.providerId, collection.id), {
+            ids,
+            trackCount: effectiveTotal || allRawSongs.length,
+            fetchedAt: Date.now(),
+            complete: !hasMore,
+          });
         }
         return allRawSongs.map(toLightSongDto);
       } catch (err) {
@@ -2079,8 +2605,15 @@ export default function activate(folium) {
         if (typeof hostState.duration === 'number' && Number.isFinite(hostState.duration) && hostState.duration >= 0) {
           currentSnapshot.duration = hostState.duration;
         }
+        if (typeof hostState.liked === 'boolean') {
+          currentSnapshot.liked = hostState.liked;
+        }
+        if (typeof hostState.canLike === 'boolean') {
+          currentSnapshot.canLike = hostState.canLike;
+        }
       }
     } catch {}
+    cachedWheelPlaylistMap.clear();
 
     if (event && event.song) {
       currentSnapshot.song = {
@@ -2096,6 +2629,8 @@ export default function activate(folium) {
     void pushSnapshot({
       song: currentSnapshot.song,
       lyrics: currentSnapshot.lyrics,
+      liked: currentSnapshot.liked,
+      canLike: currentSnapshot.canLike,
       queue: currentSnapshot.queue,
       queueTotal: currentSnapshot.queueTotal,
       queuePage: currentSnapshot.queuePage,
@@ -2235,6 +2770,13 @@ export default function activate(folium) {
     try {
       unsubs.push(folium.events.on('account.changed', () => {
         cachedCollectionMap.clear();
+        cachedWheelPlaylistMap.clear();
+        playlistMembershipCache.clear();
+        refreshLikeStateFromHost();
+        void pushSnapshot({
+          liked: currentSnapshot.liked,
+          canLike: currentSnapshot.canLike,
+        });
         if (currentSnapshot.librarySummary) {
           void handleClientAction({ action: 'fetchLibrarySummary' });
         }
@@ -2242,6 +2784,20 @@ export default function activate(folium) {
         if (openCat === 'playlists' || openCat === 'albums' || openCat === 'radio') {
           void handleClientAction({ action: 'fetchLibraryCategory', payload: { category: openCat } });
         }
+      }));
+    } catch {}
+
+    // 7d. Like state changed
+    try {
+      unsubs.push(folium.events.on('playback.likeChanged', (event) => {
+        refreshLikeStateFromHost();
+        if (typeof event?.liked === 'boolean') {
+          currentSnapshot.liked = event.liked;
+        }
+        void pushSnapshot({
+          liked: currentSnapshot.liked,
+          canLike: currentSnapshot.canLike,
+        });
       }));
     } catch {}
   }
@@ -2322,6 +2878,8 @@ export default function activate(folium) {
     updatedAt: currentSnapshot.updatedAt,
     lyrics: currentSnapshot.lyrics,
     lyricsVisible: currentSnapshot.lyricsVisible,
+    liked: currentSnapshot.liked,
+    canLike: currentSnapshot.canLike,
     queue: currentSnapshot.queue,
     queueTotal: currentSnapshot.queueTotal,
     queuePage: currentSnapshot.queuePage,
@@ -2601,6 +3159,40 @@ export default function activate(folium) {
         toggleGlobalShowLyrics();
         break;
       }
+      case 'toggleLike': {
+        await toggleCurrentSongLike();
+        break;
+      }
+      case 'fetchRadialTargets': {
+        const result = await buildRadialWheelTargets();
+        if (!isDisposed && !result.stale) {
+          void pushSnapshot({
+            liked: currentSnapshot.liked,
+            canLike: currentSnapshot.canLike,
+            radialTargets: result.targets,
+          });
+          if (typeof result.startHydration === 'function') {
+            result.startHydration();
+          }
+        }
+        break;
+      }
+      case 'selectRadialTarget': {
+        await handleRadialTargetSelection(item.payload);
+        break;
+      }
+      case 'openPlayerPage': {
+        try {
+          if (typeof folium.ui?.navigate === 'function') {
+            folium.ui.navigate('player');
+          } else {
+            tryGetInternalStores()?.appView?.getState?.()?.setView?.('player');
+          }
+        } catch (err) {
+          folium.log.warn('Failed to navigate to player page', err);
+        }
+        break;
+      }
     }
   }
 
@@ -2642,8 +3234,9 @@ export default function activate(folium) {
         await drainPendingActionsOnce();
       }
 
-      // High-assurance audio synchronization: check playback anchor on each poll cycle
+      // High-assurance audio synchronization: check playback anchor & reconcile like state on each poll cycle
       pushPlaybackAnchor(false, false);
+      reconcileLikeStateIfChanged();
     } catch {
       // Ignored
     }
@@ -2659,6 +3252,8 @@ export default function activate(folium) {
     pendingPlayTimers.forEach((timer) => clearTimeout(timer));
     pendingPlayTimers.clear();
     cachedCollectionMap.clear();
+    cachedWheelPlaylistMap.clear();
+    playlistMembershipCache.clear();
     cachedDetailRawSongs = [];
     cachedLocalPageRawSongs = [];
     cachedDailyRawSongs = [];

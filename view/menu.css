@@ -95,6 +95,34 @@ html, body {
   min-width: 0;
 }
 
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.header-action-btn {
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--text-secondary);
+  width: 26px;
+  height: 26px;
+  border-radius: 7px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: all 0.16s ease;
+  outline: none;
+}
+
+.header-action-btn:hover {
+  background: var(--button-hover-bg);
+  color: var(--text-primary);
+  border-color: var(--border-subtle);
+}
+
 .nav-back-btn {
   background: var(--bg-card);
   border: 1px solid var(--border-subtle);

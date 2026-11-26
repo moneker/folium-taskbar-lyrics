@@ -77,11 +77,35 @@ html, body {
   transition: opacity 0.18s ease;
 }
 
+/* Hover-hide right-zone slow fade buffer: gives user ~1.5s to interact with right controls before passing through */
+.app-root.hover-fading-right {
+  opacity: 0.14;
+  transition: opacity 1.5s linear;
+}
+
+/* Smooth recovery when user clicks/interacts during right-zone fade buffer */
+.app-root.hover-recovering-right {
+  opacity: 1;
+  transition: opacity 0.48s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
 /* Hover-hide active state: fades out completely so user interacts with native taskbar underneath */
 .app-root.hover-hidden {
   opacity: 0 !important;
   pointer-events: none !important;
   transition: opacity 0.14s ease;
+}
+
+/* Click-to-jump-to-player affordance in non-hover-hide modes */
+.app-root:not(.hover-hide-mode) .song-meta-section,
+.app-root:not(.hover-hide-mode) .lyrics-stage-section {
+  cursor: pointer;
+  pointer-events: auto;
+}
+
+.app-root:not(.hover-hide-mode) .song-meta-section:hover .song-title,
+.app-root:not(.hover-hide-mode) .lyrics-stage-section:hover .lyric-main {
+  filter: brightness(1.08);
 }
 
 /* In hover-hide mode, hide the left toggle button and use symmetric padding */
@@ -357,7 +381,7 @@ html, body {
 .app-root.vertical-taskbar .lyrics-stage-section {
   left: 50%;
   top: 96px;
-  bottom: 242px;
+  bottom: 278px;
   transform: translateX(-50%);
   width: 100%;
   max-width: 100%;
@@ -612,6 +636,8 @@ html, body {
 /* 3. Left Section: Song Metadata & Artwork                 */
 /* ======================================================== */
 .song-meta-section {
+  position: relative;
+  z-index: 4;
   display: flex;
   align-items: center;
   gap: 10px;
@@ -692,11 +718,12 @@ html, body {
 /* ======================================================== */
 .lyrics-stage-section {
   position: absolute;
+  z-index: 2;
   left: 50%;
   top: 50%;
   transform: translate(-50%, -50%);
   width: max-content;
-  max-width: calc(100% - 460px);
+  max-width: max(200px, calc(100% - 760px));
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -790,6 +817,8 @@ html, body {
 /* 5. Right Section: Controls & Progress Bar                */
 /* ======================================================== */
 .controls-section {
+  position: relative;
+  z-index: 4;
   display: flex;
   align-items: center;
   gap: 10px;
@@ -889,6 +918,31 @@ html, body {
 
 .action-btn:active {
   transform: scale(0.92);
+}
+
+.like-btn.liked {
+  color: #fb7185;
+  filter: drop-shadow(0 0 6px rgba(251, 113, 133, 0.55));
+}
+
+.like-btn.liked svg {
+  fill: currentColor;
+}
+
+.like-btn:disabled,
+.like-btn.like-unavailable {
+  opacity: 0.38;
+}
+
+.like-btn:disabled {
+  cursor: default;
+  transform: none;
+}
+
+.like-btn:disabled:hover {
+  background: transparent;
+  color: var(--text-secondary);
+  transform: none;
 }
 
 .play-pause-btn {

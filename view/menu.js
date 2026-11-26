@@ -14,6 +14,7 @@
   // DOM Elements - Header Navigation
   const navBackBtn = document.getElementById('navBackBtn');
   const navCrumbs = document.getElementById('navCrumbs');
+  const openPlayerBtn = document.getElementById('openPlayerBtn');
   const closeBtn = document.getElementById('closeBtn');
 
   // DOM Elements - Viewport & Toolbar
@@ -221,6 +222,14 @@
       if (navStack.length > 0) {
         navStack.pop();
         renderCurrentView();
+      }
+    });
+  }
+
+  if (openPlayerBtn) {
+    openPlayerBtn.addEventListener('click', () => {
+      if (typeof bridge.openPlayerPage === 'function') {
+        bridge.openPlayerPage();
       }
     });
   }

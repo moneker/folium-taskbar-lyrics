@@ -14,6 +14,12 @@ const COLLAPSED_WIDTH = 56; // Width of the permanent left replacement button
 const VERTICAL_BAR_HEIGHT = 48; // Height of the floating capsule/bar when taskbar is vertical (left/right)
 const MAX_PENDING_ACTIONS = 50;
 const MENU_IDLE_DESTROY_MS = 10000; // Free menuWindow renderer process after 10s idle (reclaims ~45MB)
+const RADIAL_IDLE_DESTROY_MS = 10000; // Free radialWindow renderer process after 10s idle
+const RADIAL_EXIT_ANIM_MS = 230; // Wait for smooth radial exit animation before hiding window
+const RADIAL_WINDOW_WIDTH = 328;
+const RADIAL_WINDOW_HEIGHT = 196;
+const FALLBACK_RIGHT_CONTROLS_WIDTH = 390;
+const FALLBACK_VERTICAL_CONTROLS_HEIGHT = 270;
 
 const SHELL_WINDOW_CLASSES = new Set([
   'Progman',
@@ -129,6 +135,8 @@ const TASKBAR_SNAPSHOT_KEYS = [
   'isSeek',
   'lyrics',
   'lyricsVisible',
+  'liked',
+  'canLike',
   'theme',
   'settings',
   'displayInfo',
@@ -188,11 +196,28 @@ module.exports = function activate(api) {
   let startupWindowTimer = null;
   let taskbarWindow = null;
   let menuWindow = null;
+  let radialWindow = null;
   let isEnabled = true;
   let isDrawerExpanded = false;
   let interactionMode = 'standard'; // 'standard' | 'hover-hide'
   let currentDisplayTarget = 'primary'; // 'primary' | 'secondary' | 'wallpaper' | 'display:<idx>'
   let isHoverHidden = false;
+  let hoverZoneState = 'idle'; // 'idle' | 'right-fading' | 'right-locked' | 'right-dragging'
+  let reportedControlsRect = null; // { x, y, width, height } relative to taskbarWindow
+  let radialAnchorScreenRect = null; // { x, y, width, height } in screen coords
+  let isMenuRequested = false;
+  let isMenuReady = false;
+  let isRadialRequested = false;
+  let latestRadialPayload = {
+    song: null,
+    liked: false,
+    canLike: false,
+    targets: [],
+    loading: false,
+    theme: null,
+    placement: 'top',
+    hubOffsetX: 150,
+  };
   let isFullscreenHidden = false;
   let verticalTaskbarOffsetY = null;
 
@@ -200,7 +225,11 @@ module.exports = function activate(api) {
   let clientRpcReady = false;
   let collapseTimer = null;
   let hoverWatchTimer = null;
+  let rightZoneWatchTimer = null;
   let menuDestroyTimer = null;
+  let radialDestroyTimer = null;
+  let radialHideTimer = null;
+  let radialLeaveWatchTimer = null;
   let hostCloseCheckTimer = null;
   let isCreatingOwnedWindow = false;
   const topmostRetryTimers = new Set();
@@ -497,6 +526,8 @@ module.exports = function activate(api) {
     updatedAt: Date.now(),
     lyrics: null,
     lyricsVisible: true,
+    liked: false,
+    canLike: false,
     theme: null,
     settings: {
       showLyrics: true,
@@ -590,7 +621,7 @@ module.exports = function activate(api) {
       const allWindows = BrowserWindow.getAllWindows();
       for (let i = 0; i < allWindows.length; i++) {
         const w = allWindows[i];
-        if (!w || w.isDestroyed() || w === taskbarWindow || w === menuWindow) continue;
+        if (!w || w.isDestroyed() || w === taskbarWindow || w === menuWindow || w === radialWindow) continue;
         if (w.isVisible() && w.isFullScreen()) {
           try {
             const matched = screen.getDisplayMatching(w.getBounds());
@@ -608,7 +639,11 @@ module.exports = function activate(api) {
       const hwnd = inspector.GetForegroundWindow();
       if (!hwnd) return wasFullscreen;
 
-      if (hwnd === readNativeHwnd(taskbarWindow) || hwnd === readNativeHwnd(menuWindow)) {
+      if (
+        hwnd === readNativeHwnd(taskbarWindow)
+        || hwnd === readNativeHwnd(menuWindow)
+        || hwnd === readNativeHwnd(radialWindow)
+      ) {
         return false;
       }
 
@@ -685,6 +720,9 @@ module.exports = function activate(api) {
       if (!isFullscreenHidden) {
         isFullscreenHidden = true;
         closeMenuWindow();
+        closeRadialWindow(true);
+        stopRightZoneWatch();
+        hoverZoneState = 'idle';
         try {
           taskbarWindow.setIgnoreMouseEvents(true, { forward: true });
         } catch {}
@@ -750,6 +788,13 @@ module.exports = function activate(api) {
       if (typeof taskbarWindow.moveTop === 'function') {
         taskbarWindow.moveTop();
       }
+      // Keep floating child overlays (menu / radial wheel) above the taskbar window
+      if (isMenuWindowVisible()) {
+        assertWindowTopmost(menuWindow);
+      }
+      if (isRadialWindowVisible()) {
+        assertWindowTopmost(radialWindow);
+      }
     } catch {
       // Ignored if window is mid-transition or destroying
     }
@@ -773,16 +818,122 @@ module.exports = function activate(api) {
     }
   }
 
+  function isMenuWindowVisible() {
+    return Boolean(menuWindow && !menuWindow.isDestroyed() && menuWindow.isVisible());
+  }
+
+  function isRadialWindowVisible() {
+    return Boolean(radialWindow && !radialWindow.isDestroyed() && radialWindow.isVisible());
+  }
+
+  function isPointInsideRect(pt, rect, margin = 0) {
+    if (!pt || !rect) return false;
+    return (
+      pt.x >= rect.x - margin
+      && pt.x <= rect.x + rect.width + margin
+      && pt.y >= rect.y - margin
+      && pt.y <= rect.y + rect.height + margin
+    );
+  }
+
+  /**
+   * Checks whether the cursor is currently inside the right playback controls zone (or bottom controls
+   * zone on vertical taskbars), so hover-hide watchdog does not prematurely cut off the fade buffer.
+   */
+  function isCursorInRightControlsZone(margin = 8) {
+    try {
+      const pt = screen.getCursorScreenPoint();
+      const b = resolveDrawerWindowBounds(isDrawerExpanded);
+      if (!isPointInsideRect(pt, b, margin)) return false;
+
+      if (b.orientation === 'vertical') {
+        const startY = (
+          reportedControlsRect
+          && Number.isFinite(reportedControlsRect.y)
+          && reportedControlsRect.height > 0
+        )
+          ? (b.y + reportedControlsRect.y)
+          : (b.y + Math.max(0, b.height - FALLBACK_VERTICAL_CONTROLS_HEIGHT));
+        return pt.y >= startY - margin;
+      }
+
+      const startX = (
+        reportedControlsRect
+        && Number.isFinite(reportedControlsRect.x)
+        && reportedControlsRect.width > 0
+      )
+        ? (b.x + reportedControlsRect.x)
+        : (b.x + Math.max(0, b.width - FALLBACK_RIGHT_CONTROLS_WIDTH));
+      return pt.x >= startX - margin;
+    } catch {
+      return false;
+    }
+  }
+
+  function stopRightZoneWatch() {
+    if (rightZoneWatchTimer) {
+      clearInterval(rightZoneWatchTimer);
+      rightZoneWatchTimer = null;
+    }
+  }
+
+  function isMenuWindowActive() {
+    return isMenuRequested || isMenuWindowVisible();
+  }
+
+  function startRightZoneWatch() {
+    if (rightZoneWatchTimer) return;
+    rightZoneWatchTimer = setInterval(() => {
+      if (!taskbarWindow || taskbarWindow.isDestroyed() || !isEnabled || interactionMode !== 'hover-hide' || isHoverHidden) {
+        stopRightZoneWatch();
+        hoverZoneState = 'idle';
+        return;
+      }
+      if (isMenuWindowActive() || isRadialRequested || hoverZoneState === 'right-dragging') {
+        return;
+      }
+      if (!isCursorInsideTaskbar(6)) {
+        stopRightZoneWatch();
+        hoverZoneState = 'idle';
+        try {
+          taskbarWindow.webContents.send('taskbar-lyrics:hover-zone-reset');
+        } catch {}
+      }
+    }, 80);
+  }
+
+  function setHoverZoneState(nextState) {
+    if (interactionMode !== 'hover-hide' || isHoverHidden) return;
+    const normalized = (
+      nextState === 'right-fading'
+      || nextState === 'right-locked'
+      || nextState === 'right-dragging'
+    )
+      ? nextState
+      : 'idle';
+    hoverZoneState = normalized;
+    if (normalized !== 'idle') {
+      startRightZoneWatch();
+    } else {
+      stopRightZoneWatch();
+    }
+  }
+
   /**
    * Activates hover-hide click-through so the user can interact with the native Windows taskbar underneath.
    */
   function enterHoverHide() {
     if (interactionMode !== 'hover-hide' || !isEnabled) return;
     if (!taskbarWindow || taskbarWindow.isDestroyed()) return;
+    if (isMenuWindowActive() || isRadialRequested || hoverZoneState === 'right-dragging') return;
+
+    stopRightZoneWatch();
+    hoverZoneState = 'idle';
 
     if (!isHoverHidden) {
       isHoverHidden = true;
       closeMenuWindow();
+      closeRadialWindow(true);
       try {
         taskbarWindow.setIgnoreMouseEvents(true, { forward: true });
       } catch {}
@@ -808,6 +959,8 @@ module.exports = function activate(api) {
    * Restores the taskbar lyrics window once the mouse cursor leaves the taskbar area.
    */
   function leaveHoverHide() {
+    stopRightZoneWatch();
+    hoverZoneState = 'idle';
     if (hoverWatchTimer) {
       clearInterval(hoverWatchTimer);
       hoverWatchTimer = null;
@@ -952,6 +1105,10 @@ module.exports = function activate(api) {
         } catch {}
       }
     }
+
+    if (isRadialWindowVisible()) {
+      closeRadialWindow();
+    }
   }
 
   function cycleTargetDisplay() {
@@ -1018,7 +1175,13 @@ module.exports = function activate(api) {
       if (!isDrawerExpanded) {
         expandDrawer();
       }
-      if (isCursorInsideTaskbar(0)) {
+      if (
+        isCursorInsideTaskbar(0)
+        && !isCursorInRightControlsZone(8)
+        && !isMenuWindowActive()
+        && !isRadialWindowVisible()
+        && !isRadialRequested
+      ) {
         enterHoverHide();
       }
     } else if (modeChanged) {
@@ -1091,13 +1254,21 @@ module.exports = function activate(api) {
 
     win.loadFile(path.join(__dirname, 'view', 'menu.html'));
 
+    isMenuReady = false;
+
     win.once('ready-to-show', () => {
-      if (!win.isDestroyed()) {
-        win.show();
-        win.focus();
-        latestMenuSnapshot.displayInfo = buildDisplayInfo();
-        win.webContents.send('taskbar-lyrics:snapshot', latestMenuSnapshot);
+      if (win.isDestroyed()) return;
+      isMenuReady = true;
+      if (!isMenuRequested || isDisposed || isFullscreenHidden || isHoverHidden || !isEnabled) {
+        notifyTaskbarMenuState(false);
+        return;
       }
+      win.setBounds(resolveMenuBounds());
+      win.show();
+      win.focus();
+      latestMenuSnapshot.displayInfo = buildDisplayInfo();
+      win.webContents.send('taskbar-lyrics:snapshot', latestMenuSnapshot);
+      notifyTaskbarMenuState(true);
     });
 
     win.on('blur', () => {
@@ -1107,16 +1278,37 @@ module.exports = function activate(api) {
 
     win.on('closed', () => {
       clearMenuDestroyTimer();
+      isMenuRequested = false;
+      isMenuReady = false;
       menuWindow = null;
+      notifyTaskbarMenuState(false);
     });
 
     menuWindow = win;
     return win;
   }
 
+  function notifyTaskbarMenuState(isOpen) {
+    if (taskbarWindow && !taskbarWindow.isDestroyed()) {
+      try {
+        taskbarWindow.webContents.send('taskbar-lyrics:menu-state', Boolean(isOpen));
+      } catch {}
+    }
+  }
+
   function showMenuWindow() {
+    if (!isEnabled || isDisposed || isFullscreenHidden || isHoverHidden) return null;
+    closeRadialWindow(true);
+    isMenuRequested = true;
+    if (interactionMode === 'hover-hide') {
+      setHoverZoneState('right-locked');
+    }
+    notifyTaskbarMenuState(true);
     clearMenuDestroyTimer();
     if (menuWindow && !menuWindow.isDestroyed()) {
+      if (!isMenuReady) {
+        return menuWindow;
+      }
       const bounds = resolveMenuBounds();
       menuWindow.setBounds(bounds);
       menuWindow.show();
@@ -1126,6 +1318,346 @@ module.exports = function activate(api) {
       return menuWindow;
     }
     return createMenuWindow();
+  }
+
+  function clearRadialDestroyTimer() {
+    if (radialDestroyTimer) {
+      clearTimeout(radialDestroyTimer);
+      radialDestroyTimer = null;
+    }
+  }
+
+  function clearRadialHideTimer() {
+    if (radialHideTimer) {
+      clearTimeout(radialHideTimer);
+      radialHideTimer = null;
+    }
+  }
+
+  function stopRadialLeaveWatch() {
+    if (radialLeaveWatchTimer) {
+      clearInterval(radialLeaveWatchTimer);
+      radialLeaveWatchTimer = null;
+    }
+  }
+
+  function scheduleRadialIdleDestroy() {
+    clearRadialDestroyTimer();
+    radialDestroyTimer = setTimeout(() => {
+      radialDestroyTimer = null;
+      if (radialWindow && !radialWindow.isDestroyed() && !radialWindow.isVisible()) {
+        try {
+          radialWindow.close();
+        } catch {}
+        radialWindow = null;
+      }
+    }, RADIAL_IDLE_DESTROY_MS);
+  }
+
+  function resolveRadialBounds(anchorRect) {
+    const display = resolveTargetDisplay();
+    const drawerBounds = resolveDrawerWindowBounds(true, display);
+    const dispBounds = display?.bounds || { x: 0, y: 0, width: 1920, height: 1080 };
+    const margin = 8;
+    const width = RADIAL_WINDOW_WIDTH;
+    const height = RADIAL_WINDOW_HEIGHT;
+
+    const anchorValid = anchorRect
+      && Number.isFinite(anchorRect.x)
+      && Number.isFinite(anchorRect.y)
+      && Number.isFinite(anchorRect.width)
+      && Number.isFinite(anchorRect.height);
+
+    const anchorScreen = anchorValid
+      ? {
+          x: Math.round(drawerBounds.x + anchorRect.x),
+          y: Math.round(drawerBounds.y + anchorRect.y),
+          width: Math.max(16, Math.round(anchorRect.width)),
+          height: Math.max(16, Math.round(anchorRect.height)),
+        }
+      : {
+          x: Math.round(drawerBounds.x + drawerBounds.width - 210),
+          y: Math.round(drawerBounds.y + 8),
+          width: 32,
+          height: 32,
+        };
+    radialAnchorScreenRect = anchorScreen;
+
+    const anchorCenterX = anchorScreen.x + anchorScreen.width / 2;
+    const minX = dispBounds.x + margin;
+    const maxX = Math.max(minX, dispBounds.x + dispBounds.width - width - margin);
+    let x = Math.round(Math.max(minX, Math.min(maxX, anchorCenterX - width / 2)));
+    let placement = 'top';
+    let y = Math.round(drawerBounds.y - height + 10);
+
+    if (drawerBounds.orientation === 'vertical') {
+      const centerY = anchorScreen.y + anchorScreen.height / 2;
+      const minY = dispBounds.y + margin;
+      const maxY = Math.max(minY, dispBounds.y + dispBounds.height - height - margin);
+      y = Math.round(Math.max(minY, Math.min(maxY, centerY - height + 24)));
+      if (drawerBounds.edge === 'left') {
+        x = Math.round(Math.min(maxX, drawerBounds.x + drawerBounds.width + 4));
+      } else {
+        x = Math.round(Math.max(minX, drawerBounds.x - width - 4));
+      }
+      placement = 'top';
+    } else if (y < dispBounds.y + margin) {
+      placement = 'bottom';
+      y = Math.round(Math.min(
+        dispBounds.y + dispBounds.height - height - margin,
+        drawerBounds.y + drawerBounds.height - 10,
+      ));
+    }
+
+    const hubOffsetX = Math.round(Math.max(148, Math.min(width - 148, anchorCenterX - x)));
+    return { x, y, width, height, placement, hubOffsetX };
+  }
+
+  function startRadialLeaveWatch() {
+    stopRadialLeaveWatch();
+    let outsideSince = 0;
+    radialLeaveWatchTimer = setInterval(() => {
+      if (!isRadialRequested) {
+        stopRadialLeaveWatch();
+        return;
+      }
+      // Wait for initial ready-to-show before timing out cursor leave
+      if (!isRadialWindowVisible()) {
+        if (!radialWindow || radialWindow.isDestroyed()) {
+          stopRadialLeaveWatch();
+        }
+        return;
+      }
+      try {
+        const pt = screen.getCursorScreenPoint();
+        const radBounds = radialWindow.getBounds();
+        const inRadial = isPointInsideRect(pt, radBounds, 10);
+        const inAnchor = isPointInsideRect(pt, radialAnchorScreenRect, 14);
+        if (inRadial || inAnchor) {
+          outsideSince = 0;
+          return;
+        }
+        const now = Date.now();
+        if (!outsideSince) {
+          outsideSince = now;
+        } else if (now - outsideSince >= 280) {
+          closeRadialWindow();
+        }
+      } catch {
+        closeRadialWindow();
+      }
+    }, 70);
+  }
+
+  function pushRadialPayloadToWindow() {
+    if (radialWindow && !radialWindow.isDestroyed()) {
+      try {
+        radialWindow.webContents.send('taskbar-lyrics:radial-data', latestRadialPayload);
+      } catch {}
+    }
+  }
+
+  function assertWindowTopmost(win) {
+    if (!win || win.isDestroyed()) return;
+    try {
+      win.setAlwaysOnTop(true, 'screen-saver');
+      const inspector = getWin32Inspector();
+      const hwnd = readNativeHwnd(win);
+      if (inspector && hwnd) {
+        inspector.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x0013);
+      }
+      if (typeof win.moveTop === 'function') {
+        win.moveTop();
+      }
+    } catch {}
+  }
+
+  function createRadialWindow(bounds) {
+    clearRadialDestroyTimer();
+    if (radialWindow && !radialWindow.isDestroyed()) {
+      return radialWindow;
+    }
+
+    isCreatingOwnedWindow = true;
+    let win;
+    try {
+      win = new BrowserWindow({
+        x: bounds.x,
+        y: bounds.y,
+        width: bounds.width,
+        height: bounds.height,
+        frame: false,
+        transparent: true,
+        hasShadow: false,
+        backgroundColor: '#00000000',
+        title: 'Folia Taskbar Like Wheel',
+        autoHideMenuBar: true,
+        resizable: false,
+        movable: false,
+        show: false,
+        alwaysOnTop: true,
+        skipTaskbar: true,
+        webPreferences: {
+          preload: path.join(__dirname, 'view', 'preload.cjs'),
+          nodeIntegration: false,
+          contextIsolation: true,
+          backgroundThrottling: false,
+        },
+      });
+      win.__foliaTaskbarLyricsOwned = true;
+    } finally {
+      isCreatingOwnedWindow = false;
+    }
+
+    win.setAlwaysOnTop(true, 'screen-saver');
+    if (typeof win.setVisibleOnAllWorkspaces === 'function') {
+      win.setVisibleOnAllWorkspaces(true);
+    }
+
+    win.loadFile(path.join(__dirname, 'view', 'radial.html'));
+
+    win.once('ready-to-show', () => {
+      if (win.isDestroyed()) return;
+      if (!isRadialRequested || isDisposed || isFullscreenHidden || isHoverHidden || !isEnabled) {
+        return;
+      }
+      assertWindowTopmost(win);
+      win.showInactive();
+      pushRadialPayloadToWindow();
+      startRadialLeaveWatch();
+    });
+
+    win.on('blur', () => {
+      // Allow moving focus back to taskbarWindow without tearing down while cursor is on anchor
+      try {
+        const pt = screen.getCursorScreenPoint();
+        if (isPointInsideRect(pt, radialAnchorScreenRect, 14)) {
+          startRadialLeaveWatch();
+          return;
+        }
+      } catch {}
+      closeRadialWindow();
+    });
+
+    win.on('closed', () => {
+      clearRadialDestroyTimer();
+      clearRadialHideTimer();
+      stopRadialLeaveWatch();
+      isRadialRequested = false;
+      radialWindow = null;
+      if (taskbarWindow && !taskbarWindow.isDestroyed()) {
+        try {
+          taskbarWindow.webContents.send('taskbar-lyrics:radial-closed');
+        } catch {}
+      }
+    });
+
+    radialWindow = win;
+    return win;
+  }
+
+  function openRadialWindow(anchorRect) {
+    if (!isEnabled || isDisposed || isFullscreenHidden || isHoverHidden) {
+      if (taskbarWindow && !taskbarWindow.isDestroyed()) {
+        try {
+          taskbarWindow.webContents.send('taskbar-lyrics:radial-closed');
+        } catch {}
+      }
+      return;
+    }
+    closeMenuWindow();
+    clearRadialHideTimer();
+    isRadialRequested = true;
+    if (interactionMode === 'hover-hide') {
+      setHoverZoneState('right-locked');
+    }
+    const bounds = resolveRadialBounds(anchorRect);
+    latestRadialPayload = {
+      song: latestTaskbarSnapshot.song,
+      liked: Boolean(latestTaskbarSnapshot.liked),
+      canLike: Boolean(latestTaskbarSnapshot.canLike),
+      targets: [],
+      loading: true,
+      theme: latestTaskbarSnapshot.theme,
+      placement: bounds.placement,
+      hubOffsetX: bounds.hubOffsetX,
+    };
+
+    dispatchClientAction({ action: 'fetchRadialTargets' });
+
+    clearRadialDestroyTimer();
+    stopRadialLeaveWatch();
+
+    if (radialWindow && !radialWindow.isDestroyed()) {
+      radialWindow.setBounds({
+        x: bounds.x,
+        y: bounds.y,
+        width: bounds.width,
+        height: bounds.height,
+      });
+      assertWindowTopmost(radialWindow);
+      radialWindow.showInactive();
+      pushRadialPayloadToWindow();
+    } else {
+      createRadialWindow(bounds);
+    }
+    startRadialLeaveWatch();
+  }
+
+  function closeRadialWindow(immediate = false) {
+    const hadRequest = isRadialRequested;
+    isRadialRequested = false;
+    stopRadialLeaveWatch();
+    clearRadialHideTimer();
+    const wasVisible = isRadialWindowVisible();
+    if (radialWindow && !radialWindow.isDestroyed()) {
+      if (wasVisible) {
+        try {
+          radialWindow.webContents.send('taskbar-lyrics:radial-closed');
+        } catch {}
+        if (immediate) {
+          radialWindow.hide();
+          scheduleRadialIdleDestroy();
+        } else {
+          radialHideTimer = setTimeout(() => {
+            radialHideTimer = null;
+            if (!isRadialRequested && radialWindow && !radialWindow.isDestroyed()) {
+              radialWindow.hide();
+              scheduleRadialIdleDestroy();
+            }
+          }, RADIAL_EXIT_ANIM_MS);
+        }
+      } else {
+        scheduleRadialIdleDestroy();
+      }
+    }
+    if ((wasVisible || hadRequest) && taskbarWindow && !taskbarWindow.isDestroyed()) {
+      try {
+        taskbarWindow.webContents.send('taskbar-lyrics:radial-closed');
+      } catch {}
+    }
+  }
+
+  function openHostPlayerPage() {
+    closeMenuWindow();
+    closeRadialWindow(true);
+    try {
+      const hostWins = BrowserWindow.getAllWindows().filter(isHostBrowserWindow);
+      const targetWin = hostWins[0] || null;
+      if (targetWin && !targetWin.isDestroyed()) {
+        if (targetWin.isMinimized()) {
+          targetWin.restore();
+        }
+        if (!targetWin.isVisible()) {
+          targetWin.show();
+        }
+        targetWin.focus();
+        if (typeof targetWin.moveTop === 'function') {
+          targetWin.moveTop();
+        }
+      }
+    } catch {}
+    dispatchClientAction({ action: 'openPlayerPage' });
   }
 
   function toggleMenuWindow() {
@@ -1142,6 +1674,7 @@ module.exports = function activate(api) {
   }
 
   function closeMenuWindow() {
+    isMenuRequested = false;
     const wasVisible = Boolean(menuWindow && !menuWindow.isDestroyed() && menuWindow.isVisible());
     const hadCachedLibrary = Boolean(
       latestMenuSnapshot.libraryCategoryData || latestMenuSnapshot.libraryDetailData,
@@ -1164,6 +1697,7 @@ module.exports = function activate(api) {
       }
       scheduleMenuIdleDestroy();
     }
+    notifyTaskbarMenuState(false);
   }
 
   /**
@@ -1194,6 +1728,7 @@ module.exports = function activate(api) {
     if (!isDrawerExpanded || interactionMode === 'hover-hide') return;
 
     closeMenuWindow();
+    closeRadialWindow();
     leaveHoverHide();
     isDrawerExpanded = false;
     taskbarWindow.webContents.send('taskbar-lyrics:state', 'collapsed');
@@ -1278,7 +1813,15 @@ module.exports = function activate(api) {
         win.webContents.send('taskbar-lyrics:snapshot', latestTaskbarSnapshot);
         if (interactionMode === 'hover-hide') {
           if (!isDrawerExpanded) expandDrawer();
-          if (isCursorInsideTaskbar(0)) enterHoverHide();
+          if (
+            isCursorInsideTaskbar(0)
+            && !isCursorInRightControlsZone(8)
+            && !isMenuWindowActive()
+            && !isRadialWindowVisible()
+            && !isRadialRequested
+          ) {
+            enterHoverHide();
+          }
         }
       }
     });
@@ -1294,6 +1837,8 @@ module.exports = function activate(api) {
       if (taskbarWindow && !taskbarWindow.isDestroyed() && isEnabled && !isHoverHidden) {
         if (!syncFullscreenAvoidance()) {
           taskbarWindow.moveTop();
+          if (isMenuWindowVisible()) assertWindowTopmost(menuWindow);
+          if (isRadialWindowVisible()) assertWindowTopmost(radialWindow);
         }
       }
     });
@@ -1319,8 +1864,14 @@ module.exports = function activate(api) {
     win.on('closed', () => {
       taskbarWindow = null;
       clearMenuDestroyTimer();
+      clearRadialDestroyTimer();
+      stopRadialLeaveWatch();
+      stopRightZoneWatch();
       if (menuWindow && !menuWindow.isDestroyed()) {
         menuWindow.close();
+      }
+      if (radialWindow && !radialWindow.isDestroyed()) {
+        radialWindow.close();
       }
     });
 
@@ -1333,7 +1884,8 @@ module.exports = function activate(api) {
     const senderId = event.sender.id;
     const taskbarId = taskbarWindow && !taskbarWindow.isDestroyed() ? taskbarWindow.webContents.id : null;
     const menuId = menuWindow && !menuWindow.isDestroyed() ? menuWindow.webContents.id : null;
-    return Boolean(senderId && (senderId === taskbarId || senderId === menuId));
+    const radialId = radialWindow && !radialWindow.isDestroyed() ? radialWindow.webContents.id : null;
+    return Boolean(senderId && (senderId === taskbarId || senderId === menuId || senderId === radialId));
   };
 
   // IPC Event Handlers with Sender Verification
@@ -1378,6 +1930,55 @@ module.exports = function activate(api) {
     if (isAuthorizedSender(event)) enterHoverHide();
   };
 
+  const onHoverZoneState = (event, nextState) => {
+    if (isAuthorizedSender(event)) setHoverZoneState(nextState);
+  };
+
+  const onControlsRect = (event, rect) => {
+    if (!isAuthorizedSender(event)) return;
+    if (
+      rect
+      && typeof rect.x === 'number'
+      && typeof rect.y === 'number'
+      && typeof rect.width === 'number'
+      && typeof rect.height === 'number'
+      && Number.isFinite(rect.x)
+      && Number.isFinite(rect.y)
+      && Number.isFinite(rect.width)
+      && Number.isFinite(rect.height)
+    ) {
+      reportedControlsRect = {
+        x: rect.x,
+        y: rect.y,
+        width: rect.width,
+        height: rect.height,
+      };
+    }
+  };
+
+  const onOpenRadial = (event, anchorRect) => {
+    if (isAuthorizedSender(event)) openRadialWindow(anchorRect);
+  };
+
+  const onCloseRadial = (event) => {
+    if (isAuthorizedSender(event)) closeRadialWindow();
+  };
+
+  const onRadialAnchorLeave = (event) => {
+    if (isAuthorizedSender(event) && (isRadialRequested || isRadialWindowVisible())) {
+      startRadialLeaveWatch();
+    }
+  };
+
+  const onRadialSelect = (event, target) => {
+    if (!isAuthorizedSender(event) || !target || typeof target !== 'object') return;
+    dispatchClientAction({ action: 'selectRadialTarget', payload: target });
+  };
+
+  const onOpenPlayer = (event) => {
+    if (isAuthorizedSender(event)) openHostPlayerPage();
+  };
+
   const onSwitchDisplay = (event) => {
     if (isAuthorizedSender(event)) cycleTargetDisplay();
   };
@@ -1411,6 +2012,13 @@ module.exports = function activate(api) {
   ipcMain.on('taskbar-lyrics:close-menu', onCloseMenu);
   ipcMain.on('taskbar-lyrics:assert-top', onAssertTop);
   ipcMain.on('taskbar-lyrics:hover-enter', onHoverEnter);
+  ipcMain.on('taskbar-lyrics:hover-zone-state', onHoverZoneState);
+  ipcMain.on('taskbar-lyrics:controls-rect', onControlsRect);
+  ipcMain.on('taskbar-lyrics:open-radial', onOpenRadial);
+  ipcMain.on('taskbar-lyrics:close-radial', onCloseRadial);
+  ipcMain.on('taskbar-lyrics:radial-anchor-leave', onRadialAnchorLeave);
+  ipcMain.on('taskbar-lyrics:radial-select', onRadialSelect);
+  ipcMain.on('taskbar-lyrics:open-player', onOpenPlayer);
   ipcMain.on('taskbar-lyrics:switch-display', onSwitchDisplay);
   ipcMain.on('taskbar-lyrics:move-vertical', onMoveVertical);
 
@@ -1441,6 +2049,9 @@ module.exports = function activate(api) {
       }
     }
 
+    const prevSongTitle = latestTaskbarSnapshot.song?.title || '';
+    const prevSongArtist = latestTaskbarSnapshot.song?.artist || '';
+
     if (hasTaskbarDelta) {
       latestTaskbarSnapshot = {
         ...latestTaskbarSnapshot,
@@ -1451,6 +2062,11 @@ module.exports = function activate(api) {
         taskbarWindow.webContents.send('taskbar-lyrics:snapshot', taskbarDelta);
       }
     }
+
+    const songChangedInDelta = Object.prototype.hasOwnProperty.call(snapshot, 'song') && (
+      (latestTaskbarSnapshot.song?.title || '') !== prevSongTitle
+      || (latestTaskbarSnapshot.song?.artist || '') !== prevSongArtist
+    );
 
     const menuDelta = {};
     let hasMenuDelta = false;
@@ -1472,6 +2088,64 @@ module.exports = function activate(api) {
       if (isMenuVisible) {
         menuWindow.webContents.send('taskbar-lyrics:snapshot', menuDelta);
       }
+    }
+
+    let radialChanged = false;
+    if (Object.prototype.hasOwnProperty.call(snapshot, 'radialTargets')) {
+      latestRadialPayload = {
+        ...latestRadialPayload,
+        targets: Array.isArray(snapshot.radialTargets) ? snapshot.radialTargets : [],
+        loading: false,
+        song: latestTaskbarSnapshot.song,
+        liked: Boolean(latestTaskbarSnapshot.liked),
+        canLike: Boolean(latestTaskbarSnapshot.canLike),
+        theme: latestTaskbarSnapshot.theme,
+      };
+      radialChanged = true;
+    } else if (
+      Object.prototype.hasOwnProperty.call(snapshot, 'liked')
+      || Object.prototype.hasOwnProperty.call(snapshot, 'canLike')
+      || Object.prototype.hasOwnProperty.call(snapshot, 'theme')
+      || Object.prototype.hasOwnProperty.call(snapshot, 'song')
+    ) {
+      const nextLiked = Boolean(latestTaskbarSnapshot.liked);
+      const nextCanLike = Boolean(latestTaskbarSnapshot.canLike);
+      let nextTargets = songChangedInDelta ? [] : latestRadialPayload.targets;
+      if (!songChangedInDelta && Array.isArray(nextTargets) && nextTargets.length > 0 && nextTargets[0]?.kind === 'like') {
+        nextTargets = [
+          {
+            ...nextTargets[0],
+            liked: nextLiked,
+            canLike: nextCanLike,
+            disabled: !nextCanLike,
+            name: nextLiked ? '取消喜欢' : '我喜欢的音乐',
+            shortName: nextLiked ? '取消喜欢' : '我喜欢',
+          },
+          ...nextTargets.slice(1),
+        ];
+      }
+      latestRadialPayload = {
+        ...latestRadialPayload,
+        song: latestTaskbarSnapshot.song,
+        liked: nextLiked,
+        canLike: nextCanLike,
+        targets: nextTargets,
+        loading: songChangedInDelta ? true : latestRadialPayload.loading,
+        theme: latestTaskbarSnapshot.theme,
+      };
+      if (songChangedInDelta && (isRadialRequested || isRadialWindowVisible())) {
+        dispatchClientAction({ action: 'fetchRadialTargets' });
+      }
+      radialChanged = isRadialWindowVisible();
+    }
+    if (radialChanged && isRadialWindowVisible()) {
+      pushRadialPayloadToWindow();
+    }
+
+    if (snapshot.radialFeedback && isRadialWindowVisible()) {
+      try {
+        radialWindow.webContents.send('taskbar-lyrics:radial-feedback', snapshot.radialFeedback);
+      } catch {}
     }
 
     return true;
@@ -1513,6 +2187,7 @@ module.exports = function activate(api) {
       || win.isDestroyed()
       || win === taskbarWindow
       || win === menuWindow
+      || win === radialWindow
       || win.__foliaTaskbarLyricsOwned
     ) {
       return false;
@@ -1541,6 +2216,10 @@ module.exports = function activate(api) {
       clearInterval(hoverWatchTimer);
       hoverWatchTimer = null;
     }
+    stopRightZoneWatch();
+    stopRadialLeaveWatch();
+    clearRadialDestroyTimer();
+    clearRadialHideTimer();
     if (hostCloseCheckTimer) {
       clearTimeout(hostCloseCheckTimer);
       hostCloseCheckTimer = null;
@@ -1556,7 +2235,15 @@ module.exports = function activate(api) {
     clearOwnedTimers();
     isDrawerExpanded = false;
     isHoverHidden = false;
+    hoverZoneState = 'idle';
+    isMenuRequested = false;
+    isMenuReady = false;
+    isRadialRequested = false;
     isFullscreenHidden = false;
+    if (radialWindow && !radialWindow.isDestroyed()) {
+      radialWindow.close();
+      radialWindow = null;
+    }
     if (menuWindow && !menuWindow.isDestroyed()) {
       menuWindow.close();
       menuWindow = null;
@@ -1653,12 +2340,27 @@ module.exports = function activate(api) {
       return;
     }
     if (interactionMode === 'hover-hide') {
-      if (!isHoverHidden && isCursorInsideTaskbar(0)) {
+      if (isHoverHidden) {
+        return;
+      }
+      if (
+        isCursorInsideTaskbar(0)
+        && !isCursorInRightControlsZone(8)
+        && !isMenuWindowActive()
+        && !isRadialRequested
+        && hoverZoneState !== 'right-dragging'
+      ) {
         enterHoverHide();
         return;
       }
-      if (isHoverHidden) {
-        return;
+      if (hoverZoneState === 'right-fading' || hoverZoneState === 'right-locked') {
+        if (!isMenuWindowActive() && !isRadialRequested && !isCursorInsideTaskbar(6)) {
+          stopRightZoneWatch();
+          hoverZoneState = 'idle';
+          try {
+            taskbarWindow.webContents.send('taskbar-lyrics:hover-zone-reset');
+          } catch {}
+        }
       }
     }
     assertTopmost();
@@ -1700,6 +2402,13 @@ module.exports = function activate(api) {
     ipcMain.removeListener('taskbar-lyrics:close-menu', onCloseMenu);
     ipcMain.removeListener('taskbar-lyrics:assert-top', onAssertTop);
     ipcMain.removeListener('taskbar-lyrics:hover-enter', onHoverEnter);
+    ipcMain.removeListener('taskbar-lyrics:hover-zone-state', onHoverZoneState);
+    ipcMain.removeListener('taskbar-lyrics:controls-rect', onControlsRect);
+    ipcMain.removeListener('taskbar-lyrics:open-radial', onOpenRadial);
+    ipcMain.removeListener('taskbar-lyrics:close-radial', onCloseRadial);
+    ipcMain.removeListener('taskbar-lyrics:radial-anchor-leave', onRadialAnchorLeave);
+    ipcMain.removeListener('taskbar-lyrics:radial-select', onRadialSelect);
+    ipcMain.removeListener('taskbar-lyrics:open-player', onOpenPlayer);
     ipcMain.removeListener('taskbar-lyrics:switch-display', onSwitchDisplay);
     ipcMain.removeListener('taskbar-lyrics:move-vertical', onMoveVertical);
 

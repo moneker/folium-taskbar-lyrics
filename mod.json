@@ -2,7 +2,7 @@
   "folium": 2,
   "id": "taskbar-lyrics",
   "name": "任务栏抽屉歌词",
-  "version": "1.0.8",
+  "version": "1.0.10",
   "author": "moneker",
   "repository": "https://github.com/moneker/folium-taskbar-lyrics",
   "bugs": "https://github.com/moneker/folium-taskbar-lyrics/issues",
