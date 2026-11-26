@@ -87,6 +87,7 @@ export default function activate(folium) {
     duration: 0,
     updatedAt: Date.now(),
     lyrics: null,
+    lyricsVisible: true,
     lyricOffsetMs: 0,
     songLyricOffsetMs: 0,
     globalLyricOffsetMs: 0,
@@ -109,6 +110,7 @@ export default function activate(folium) {
     settings: {
       interactionMode: 'standard',
       targetDisplay: 'primary',
+      showLyrics: true,
       showTranslation: true,
       useCoverBackground: true,
       globalLyricOffsetMs: 0,
@@ -524,6 +526,28 @@ export default function activate(folium) {
       pendingOffsetOps.push(op);
     }
     void pushSnapshot(syncEffectiveLyricOffset());
+  }
+
+  function syncLyricsDisplayState() {
+    const lyricsVisible = currentSnapshot.settings?.showLyrics !== false;
+    currentSnapshot.lyricsVisible = lyricsVisible;
+    return { lyricsVisible };
+  }
+
+  function toggleGlobalShowLyrics() {
+    const nextShow = currentSnapshot.settings?.showLyrics === false;
+    currentSnapshot.settings = {
+      ...currentSnapshot.settings,
+      showLyrics: nextShow,
+    };
+    const displaySnap = syncLyricsDisplayState();
+    try {
+      settingsAccess?.set?.({ showLyrics: nextShow });
+    } catch {}
+    void pushSnapshot({
+      settings: currentSnapshot.settings,
+      ...displaySnap,
+    });
   }
 
   async function loadStoredTrackLists() {
@@ -1689,6 +1713,19 @@ export default function activate(folium) {
         ],
       },
       {
+        key: 'showLyrics',
+        type: 'boolean',
+        label: {
+          'zh-CN': '显示任务栏歌词',
+          en: 'Show Taskbar Lyrics',
+        },
+        description: {
+          'zh-CN': '关闭后任务栏中央仅静态显示当前曲目标题与作者（也可在弹窗底部一键切换或绑定全局快捷键）',
+          en: 'When disabled, the center stage shows song title and artist only instead of scrolling lyrics',
+        },
+        defaultValue: true,
+      },
+      {
         key: 'showTranslation',
         type: 'boolean',
         label: {
@@ -1759,12 +1796,28 @@ export default function activate(folium) {
         void folium.rpc.call('switchDisplay');
       },
     });
+    folium.registries.commands.register({
+      id: 'toggle-lyrics',
+      label: {
+        'zh-CN': '显示/隐藏任务栏歌词正文',
+        en: 'Toggle Taskbar Lyrics Text',
+      },
+      description: {
+        'zh-CN': '切换任务栏中央是否显示滚动歌词（隐藏时仅展示歌名与作者）',
+        en: 'Toggle scrolling lyrics in the taskbar drawer (shows song title and artist when hidden)',
+      },
+      globalShortcut: true,
+      run: () => {
+        toggleGlobalShowLyrics();
+      },
+    });
   }
 
   function syncSettings() {
     try {
       if (settingsAccess?.get) {
         const values = settingsAccess.get();
+        const showLyrics = values?.showLyrics;
         const showTr = values?.showTranslation;
         const useBg = values?.useCoverBackground;
         const mode = values?.interactionMode === 'hover-hide' ? 'hover-hide' : 'standard';
@@ -1773,11 +1826,13 @@ export default function activate(folium) {
         currentSnapshot.settings = {
           interactionMode: mode,
           targetDisplay: display,
+          showLyrics: typeof showLyrics === 'boolean' ? showLyrics : true,
           showTranslation: typeof showTr === 'boolean' ? showTr : true,
           useCoverBackground: typeof useBg === 'boolean' ? useBg : true,
           globalLyricOffsetMs: globalOffsetMs,
         };
         syncEffectiveLyricOffset();
+        syncLyricsDisplayState();
       }
     } catch {
       // Ignored
@@ -1794,6 +1849,7 @@ export default function activate(folium) {
       void pushSnapshot({
         settings: currentSnapshot.settings,
         ...syncEffectiveLyricOffset(),
+        ...syncLyricsDisplayState(),
       });
     }));
   }
@@ -1938,6 +1994,7 @@ export default function activate(folium) {
 
     syncHostLyricsAndSong(true, hasEventSong);
     const offsetSnap = syncEffectiveLyricOffset();
+    const displaySnap = syncLyricsDisplayState();
     if (currentSnapshot.song) {
       recordRecentSong(currentSnapshot.song);
     }
@@ -1946,6 +2003,7 @@ export default function activate(folium) {
       song: currentSnapshot.song,
       lyrics: currentSnapshot.lyrics,
       ...offsetSnap,
+      ...displaySnap,
       liked: currentSnapshot.liked,
       canLike: currentSnapshot.canLike,
       recentTracks: currentSnapshot.recentTracks,
@@ -2123,6 +2181,7 @@ export default function activate(folium) {
   lastAudioSyncPushWallTime = currentSnapshot.updatedAt;
   syncHostLyricsAndSong();
   const initialOffsets = syncEffectiveLyricOffset();
+  const initialDisplay = syncLyricsDisplayState();
   refreshAudioState();
   refreshQueue();
   refreshProviders();
@@ -2137,6 +2196,7 @@ export default function activate(folium) {
     updatedAt: currentSnapshot.updatedAt,
     lyrics: currentSnapshot.lyrics,
     ...initialOffsets,
+    ...initialDisplay,
     liked: currentSnapshot.liked,
     canLike: currentSnapshot.canLike,
     queue: currentSnapshot.queue,
@@ -2401,6 +2461,9 @@ export default function activate(folium) {
         break;
       case 'resetSongLyricOffset':
         resetCurrentSongLyricOffset();
+        break;
+      case 'toggleShowLyrics':
+        toggleGlobalShowLyrics();
         break;
     }
   }

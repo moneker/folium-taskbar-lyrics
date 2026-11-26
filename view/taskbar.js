@@ -65,12 +65,14 @@
     duration: 0,
     updatedAt: Date.now(),
     lyrics: null,
+    lyricsVisible: true,
     liked: false,
     canLike: false,
     lyricOffsetMs: 0,
     settings: {
       interactionMode: 'standard',
       targetDisplay: 'primary',
+      showLyrics: true,
       showTranslation: true,
       useCoverBackground: true,
     },
@@ -707,6 +709,14 @@
       }
       snapshot.lyricOffsetMs = data.lyricOffsetMs;
     }
+    let lyricsVisibilityChanged = false;
+    if (data.lyricsVisible !== undefined) {
+      const nextVisible = Boolean(data.lyricsVisible);
+      if (nextVisible !== snapshot.lyricsVisible) {
+        lyricsVisibilityChanged = true;
+      }
+      snapshot.lyricsVisible = nextVisible;
+    }
     snapshot.currentTime = nextCurrentTime;
     snapshot.updatedAt = nextUpdatedAt;
     snapshot.lyrics = nextLyrics;
@@ -721,15 +731,28 @@
     }
 
     if (data.settings) {
+      const prevShowLyrics = snapshot.settings?.showLyrics !== false;
       snapshot.settings = {
         ...snapshot.settings,
         ...data.settings,
       };
+      const nextShowLyrics = snapshot.settings?.showLyrics !== false;
+      if (prevShowLyrics !== nextShowLyrics) {
+        lyricsVisibilityChanged = true;
+      }
       const isHoverMode = snapshot.settings.interactionMode === 'hover-hide';
       appRoot.classList.toggle('hover-hide-mode', isHoverMode);
     }
 
-    if (data.song !== undefined || data.duration !== undefined || data.lyrics !== undefined || data.settings !== undefined) {
+    if (lyricsVisibilityChanged) {
+      activeLineIndex = -999;
+      currentActiveLine = null;
+      lastWipeLineIndex = -999;
+      lastWipePct = 0;
+      isDiscontinuous = true;
+    }
+
+    if (data.song !== undefined || data.duration !== undefined || data.lyrics !== undefined || data.settings !== undefined || lyricsVisibilityChanged) {
       updateMetadata();
     }
     if (data.liked !== undefined || data.canLike !== undefined || data.song !== undefined) {
@@ -742,6 +765,10 @@
     renderSingleFrame(isDiscontinuous);
     syncRenderLoop();
   });
+
+  function isLyricsDisplayEnabled() {
+    return snapshot.lyricsVisible !== false && snapshot.settings?.showLyrics !== false;
+  }
 
   // Update Metadata (Song Title, Artist, Cover)
   function updateMetadata() {
@@ -761,8 +788,8 @@
         if (coverFallback) coverFallback.style.display = 'flex';
       }
 
-      // If lyrics are not present yet, immediately display song info in center stage
-      if (!snapshot.lyrics || !Array.isArray(snapshot.lyrics.lines) || snapshot.lyrics.lines.length === 0) {
+      // If lyrics are hidden or not present yet, immediately display song info in center stage
+      if (!isLyricsDisplayEnabled() || !snapshot.lyrics || !Array.isArray(snapshot.lyrics.lines) || snapshot.lyrics.lines.length === 0) {
         if (song.title) {
           lyricMain.textContent = song.title;
           lyricSub.textContent = song.artist || '';
@@ -912,7 +939,7 @@
   // Update Karaoke Lyric Line
   function updateLyrics(time, allowBackward = false) {
     const lyrics = snapshot.lyrics;
-    if (!lyrics || !Array.isArray(lyrics.lines) || lyrics.lines.length === 0) {
+    if (!isLyricsDisplayEnabled() || !lyrics || !Array.isArray(lyrics.lines) || lyrics.lines.length === 0) {
       if (activeLineIndex !== -1) {
         activeLineIndex = -1;
         currentActiveLine = null;

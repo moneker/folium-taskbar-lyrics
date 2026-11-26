@@ -33,6 +33,9 @@
   const offsetMinusBtn = document.getElementById('offsetMinusBtn');
   const offsetResetBtn = document.getElementById('offsetResetBtn');
   const offsetPlusBtn = document.getElementById('offsetPlusBtn');
+  const lyricsToggleBtn = document.getElementById('lyricsToggleBtn');
+  const lyricsEyeIcon = document.getElementById('lyricsEyeIcon');
+  const lyricsEyeOffIcon = document.getElementById('lyricsEyeOffIcon');
 
   let activeTab = 'queue'; // 'queue' | 'search' | 'explore' | 'saved'
   let savedSubTab = 'saved'; // 'saved' | 'recent'
@@ -55,6 +58,8 @@
     loopMode: 'all',
     volume: 100,
     isMuted: false,
+    showLyrics: true,
+    lyricsVisible: true,
     lyricOffsetMs: 0,
     songLyricOffsetMs: 0,
     globalLyricOffsetMs: 0,
@@ -211,10 +216,6 @@
     rootStyle.setProperty('--accent-glow', colorWithAlpha(accent, 0.35));
     rootStyle.setProperty('--accent-gradient', `linear-gradient(135deg, ${accent}, ${colorWithAlpha(accent, 0.8)})`);
     rootStyle.setProperty('--scrollbar-thumb', colorWithAlpha(primary, isDaylight ? 0.20 : 0.25));
-
-    if (theme.fontFamily) {
-      rootStyle.setProperty('--app-font-family', theme.fontFamily);
-    }
   }
 
   // =========================================================================
@@ -1102,6 +1103,29 @@
     });
   }
 
+  function updateLyricsDisplayControls() {
+    const showGlobal = footerState.showLyrics !== false && footerState.lyricsVisible !== false;
+    if (lyricsToggleBtn) {
+      lyricsToggleBtn.classList.toggle('is-muted', !showGlobal);
+      lyricsToggleBtn.setAttribute('aria-pressed', showGlobal ? 'true' : 'false');
+      lyricsToggleBtn.title = showGlobal
+        ? '点击隐藏任务栏歌词（仅显示歌名与作者）'
+        : '点击恢复显示任务栏歌词';
+    }
+    if (lyricsEyeIcon) {
+      lyricsEyeIcon.classList.toggle('hidden', !showGlobal);
+    }
+    if (lyricsEyeOffIcon) {
+      lyricsEyeOffIcon.classList.toggle('hidden', showGlobal);
+    }
+  }
+
+  if (lyricsToggleBtn) {
+    lyricsToggleBtn.addEventListener('click', () => {
+      bridge.sendPlaybackAction('toggleShowLyrics');
+    });
+  }
+
   function formatOffsetMs(ms) {
     const val = Math.round(Number(ms) || 0);
     if (val === 0) return '0ms';
@@ -1234,6 +1258,7 @@
       const nextKey = portableKey(data.song?.source, data.song?.id);
       currentSong = data.song;
       updateOffsetControls();
+      updateLyricsDisplayControls();
       if (activeTab === 'saved') shouldRender = true;
       if (activeTab === 'explore' && prevKey !== nextKey && (!exploreData || exploreData.view === 'overview')) {
         bridge.sendPlaybackAction('fetchExplore', { kind: 'overview' });
@@ -1242,6 +1267,7 @@
 
     if (Array.isArray(data.providers)) {
       providers = data.providers;
+      updateLyricsDisplayControls();
       if (activeTab === 'search') shouldRender = true;
     }
 
@@ -1308,11 +1334,22 @@
       updateOffsetControls();
     }
 
+    if (data.settings !== undefined || data.lyricsVisible !== undefined) {
+      if (data.settings && typeof data.settings.showLyrics === 'boolean') {
+        footerState.showLyrics = data.settings.showLyrics;
+      }
+      if (typeof data.lyricsVisible === 'boolean') {
+        footerState.lyricsVisible = data.lyricsVisible;
+      }
+      updateLyricsDisplayControls();
+    }
+
     if (shouldRender) {
       renderActiveTab();
     }
   });
 
+  updateLyricsDisplayControls();
   updateOffsetControls();
   renderActiveTab();
 })();
