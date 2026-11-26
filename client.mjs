@@ -741,17 +741,25 @@ export default function activate(folium) {
   function getSongMatchKeys(song) {
     const keys = new Set();
     if (!song || typeof song !== 'object') return keys;
-    const addKey = (val) => {
+    const addKey = (val, lowercase = false) => {
       if (val !== undefined && val !== null && val !== '') {
-        keys.add(String(val));
+        const str = String(val).trim();
+        if (str) keys.add(lowercase ? str.toLowerCase() : str);
       }
     };
-    addKey(song.id);
-    addKey(song.sourceRef?.mediaId);
-    addKey(song.hash);
+    const pData = song.sourceRef?.kind === 'online' ? song.sourceRef.providerData : null;
+    addKey(song.id, true);
+    addKey(song.sourceRef?.mediaId, true);
+    addKey(song.hash, true);
+    addKey(pData?.hash, true);
+    addKey(pData?.albumAudioId);
+    addKey(pData?.mixSongId);
     addKey(song.mid);
+    addKey(pData?.mid);
     addKey(song.songmid);
+    addKey(pData?.songmid);
     addKey(song.emixsongid);
+    // Note: intentionally exclude providerData.fileId (KuGou playlist-local row id, not a global song identity)
     return keys;
   }
 
@@ -767,16 +775,31 @@ export default function activate(folium) {
     return false;
   }
 
-  function recordSongInMembershipCache(providerId, playlistId, song, trackCount = 0) {
+  function recordSongInMembershipCache(providerId, playlistId, song, trackCount = 0, playlistOwnedTrack = null) {
     const cacheKey = makeMembershipCacheKey(providerId, playlistId);
     const matchKeys = getSongMatchKeys(song);
     if (matchKeys.size === 0) return;
     let entry = playlistMembershipCache.get(cacheKey);
     if (!entry) {
-      entry = { ids: new Set(), trackCount: Number(trackCount) || 0, fetchedAt: Date.now(), complete: false };
+      entry = {
+        ids: new Set(),
+        tracksByKey: new Map(),
+        trackCount: Number(trackCount) || 0,
+        fetchedAt: Date.now(),
+        complete: false,
+      };
       playlistMembershipCache.set(cacheKey, entry);
     }
-    matchKeys.forEach((k) => entry.ids.add(k));
+    if (!entry.tracksByKey) entry.tracksByKey = new Map();
+    matchKeys.forEach((k) => {
+      entry.ids.add(k);
+      if (playlistOwnedTrack) {
+        entry.tracksByKey.set(k, playlistOwnedTrack);
+      } else {
+        // Newly added song does not yet have its playlist-local row id (e.g. KuGou fileId) until re-fetched
+        entry.tracksByKey.delete(k);
+      }
+    });
     if (trackCount > entry.trackCount) {
       entry.trackCount = trackCount;
     }
@@ -791,11 +814,100 @@ export default function activate(folium) {
     let removed = false;
     matchKeys.forEach((k) => {
       if (entry.ids.delete(k)) removed = true;
+      entry.tracksByKey?.delete(k);
     });
     if (removed && entry.trackCount > 0) {
       entry.trackCount = Math.max(0, entry.trackCount - 1);
     }
     entry.fetchedAt = Date.now();
+  }
+
+  function getCachedPlaylistOwnedTrack(providerId, playlistId, matchKeys) {
+    const entry = playlistMembershipCache.get(makeMembershipCacheKey(providerId, playlistId));
+    if (!entry || !entry.tracksByKey || !matchKeys) return null;
+    for (const k of matchKeys) {
+      const found = entry.tracksByKey.get(k);
+      if (found) return found;
+    }
+    return null;
+  }
+
+  /**
+   * Resolves the exact track row object owned by `playlist` (carrying playlist-local metadata such as
+   * KuGou's `sourceRef.providerData.fileId`). Never reuses a song object from another playlist for deletion.
+   */
+  async function resolvePlaylistOwnedTrackForRemoval(omni, playlist, rawSong, forceRefresh = false) {
+    const matchKeys = getSongMatchKeys(rawSong);
+    if (matchKeys.size === 0) return null;
+
+    if (!forceRefresh) {
+      const cachedTrack = getCachedPlaylistOwnedTrack(playlist.providerId, playlist.id, matchKeys);
+      if (cachedTrack) {
+        return cachedTrack;
+      }
+    }
+
+    if (typeof omni?.getCollectionTracks !== 'function') {
+      return null;
+    }
+
+    const pageSize = 100;
+    const maxPages = 20;
+    const ids = new Set();
+    const tracksByKey = new Map();
+    let offset = 0;
+    let matched = null;
+    let complete = true;
+
+    for (let pageIdx = 0; pageIdx < maxPages; pageIdx++) {
+      let page;
+      try {
+        page = await omni.getCollectionTracks(playlist, { limit: pageSize, offset });
+      } catch {
+        complete = false;
+        break;
+      }
+      const items = Array.isArray(page?.items) ? page.items : [];
+      for (const item of items) {
+        const itemKeys = getSongMatchKeys(item);
+        itemKeys.forEach((k) => {
+          ids.add(k);
+          tracksByKey.set(k, item);
+        });
+        if (!matched && songMatchesTrackIdSet(matchKeys, itemKeys)) {
+          matched = item;
+        }
+      }
+      const reportedMore = typeof page?.hasMore === 'boolean' ? page.hasMore : items.length >= pageSize;
+      if (matched || !reportedMore || items.length === 0) {
+        if (reportedMore && items.length > 0) {
+          complete = false;
+        }
+        break;
+      }
+      if (pageIdx === maxPages - 1) {
+        complete = false;
+      }
+      offset = (typeof page?.nextOffset === 'number' && page.nextOffset > offset)
+        ? page.nextOffset
+        : (offset + items.length);
+    }
+
+    if (ids.size > 0) {
+      const existing = playlistMembershipCache.get(makeMembershipCacheKey(playlist.providerId, playlist.id));
+      const mergedIds = existing ? new Set([...existing.ids, ...ids]) : ids;
+      const mergedTracks = existing?.tracksByKey ? new Map(existing.tracksByKey) : new Map();
+      tracksByKey.forEach((v, k) => mergedTracks.set(k, v));
+      playlistMembershipCache.set(makeMembershipCacheKey(playlist.providerId, playlist.id), {
+        ids: mergedIds,
+        tracksByKey: mergedTracks,
+        trackCount: Number(playlist.trackCount ?? playlist.songCount ?? mergedIds.size) || mergedIds.size,
+        fetchedAt: Date.now(),
+        complete: complete || Boolean(existing?.complete),
+      });
+    }
+
+    return matched;
   }
 
   function isMembershipCacheFresh(entry, expectedTrackCount) {
@@ -828,6 +940,7 @@ export default function activate(folium) {
       if (isMembershipCacheFresh(existing, expectedCount)) return;
 
       const ids = existing ? new Set(existing.ids) : new Set();
+      const tracksByKey = existing?.tracksByKey ? new Map(existing.tracksByKey) : new Map();
       let offset = 0;
       let complete = true;
 
@@ -842,7 +955,10 @@ export default function activate(folium) {
         }
         const items = Array.isArray(page?.items) ? page.items : [];
         for (const item of items) {
-          getSongMatchKeys(item).forEach((k) => ids.add(k));
+          getSongMatchKeys(item).forEach((k) => {
+            ids.add(k);
+            tracksByKey.set(k, item);
+          });
         }
         const reportedMore = typeof page?.hasMore === 'boolean' ? page.hasMore : items.length >= pageSize;
         if (!reportedMore || items.length === 0) {
@@ -858,6 +974,7 @@ export default function activate(folium) {
 
       playlistMembershipCache.set(cacheKey, {
         ids,
+        tracksByKey,
         trackCount: expectedCount || ids.size,
         fetchedAt: Date.now(),
         complete,
@@ -1110,7 +1227,40 @@ export default function activate(folium) {
         return;
       }
       try {
-        await omni.updateCollectionTracks(playlist, 'del', [rawSong]);
+        // Resolve the track row belonging to THIS specific playlist (required by KuGou playlist_tracks_del fileid)
+        const playlistOwnedTrack = await resolvePlaylistOwnedTrackForRemoval(omni, playlist, rawSong);
+        const isKugouPlaylist = String(playlist.providerId || '').toLowerCase() === 'kugou';
+        if (isKugouPlaylist && !playlistOwnedTrack) {
+          removeSongFromMembershipCache(playlist.providerId, playlist.id, rawSong);
+          const message = `该歌曲已不在「${playlist.name || '歌单'}」中`;
+          try { folium.ui?.toast?.(message, { type: 'info', durationMs: 2200 }); } catch {}
+          if (!isDisposed && selectSeq === radialSelectSeq) {
+            void pushSnapshot({
+              radialFeedback: { ok: true, removed: true, targetId, message },
+            });
+          }
+          return;
+        }
+        const trackToDelete = playlistOwnedTrack || rawSong;
+        try {
+          await omni.updateCollectionTracks(playlist, 'del', [trackToDelete]);
+        } catch (delErr) {
+          if (!isKugouPlaylist) throw delErr;
+          // Retry once with freshly fetched KuGou playlist row in case cached fileId became stale
+          const freshTrack = await resolvePlaylistOwnedTrackForRemoval(omni, playlist, rawSong, true);
+          if (!freshTrack) {
+            removeSongFromMembershipCache(playlist.providerId, playlist.id, rawSong);
+            const message = `该歌曲已不在「${playlist.name || '歌单'}」中`;
+            try { folium.ui?.toast?.(message, { type: 'info', durationMs: 2200 }); } catch {}
+            if (!isDisposed && selectSeq === radialSelectSeq) {
+              void pushSnapshot({
+                radialFeedback: { ok: true, removed: true, targetId, message },
+              });
+            }
+            return;
+          }
+          await omni.updateCollectionTracks(playlist, 'del', [freshTrack]);
+        }
         removeSongFromMembershipCache(playlist.providerId, playlist.id, rawSong);
         if (typeof omni.refreshProviderPlaylists === 'function' && playlist.providerId) {
           void omni.refreshProviderPlaylists(playlist.providerId).catch(() => {});
@@ -1857,11 +2007,17 @@ export default function activate(folium) {
         // Seed membership cache for free whenever user browses an online playlist in the menu
         if (collection.type === 'playlist' && allRawSongs.length > 0) {
           const ids = new Set();
+          const tracksByKey = new Map();
           allRawSongs.forEach((entry) => {
-            getSongMatchKeys(entry.rawSong || entry).forEach((k) => ids.add(k));
+            const raw = entry.rawSong || entry;
+            getSongMatchKeys(raw).forEach((k) => {
+              ids.add(k);
+              tracksByKey.set(k, raw);
+            });
           });
           playlistMembershipCache.set(makeMembershipCacheKey(collection.providerId, collection.id), {
             ids,
+            tracksByKey,
             trackCount: effectiveTotal || allRawSongs.length,
             fetchedAt: Date.now(),
             complete: !hasMore,
