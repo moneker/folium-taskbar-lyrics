@@ -28,6 +28,7 @@
   const progressBar = document.getElementById('progressBar');
   const progressFill = document.getElementById('progressFill');
   const progressThumb = document.getElementById('progressThumb');
+  const likeBtn = document.getElementById('likeBtn');
   const prevBtn = document.getElementById('prevBtn');
   const playPauseBtn = document.getElementById('playPauseBtn');
   const nextBtn = document.getElementById('nextBtn');
@@ -64,6 +65,8 @@
     duration: 0,
     updatedAt: Date.now(),
     lyrics: null,
+    liked: false,
+    canLike: false,
     lyricOffsetMs: 0,
     settings: {
       interactionMode: 'standard',
@@ -262,6 +265,7 @@
   function setDrawerExpanded(expanded) {
     if (isExpanded === expanded) return;
     isExpanded = expanded;
+    setAnimating(true);
 
     if (expanded) {
       // Enter from right to left (100% -> 0)
@@ -353,6 +357,13 @@
   toggleBtn.addEventListener('click', handleToggleTrigger);
 
   // Playback Control Buttons
+  if (likeBtn) {
+    likeBtn.addEventListener('click', () => {
+      if (!likeBtn.disabled) {
+        bridge.sendPlaybackAction('toggleLike');
+      }
+    });
+  }
   prevBtn.addEventListener('click', () => bridge.sendPlaybackAction('prev'));
   nextBtn.addEventListener('click', () => bridge.sendPlaybackAction('next'));
   playPauseBtn.addEventListener('click', () => bridge.sendPlaybackAction('toggle'));
@@ -444,7 +455,6 @@
 
   // Receive Drawer State from Main Process
   bridge.onDrawerState((state) => {
-    setAnimating(false);
     setDrawerExpanded(state === 'expanded');
   });
 
@@ -533,9 +543,25 @@
   }
 
   // Receive Snapshot from Main Process
-  let lastSongTitle = '';
-  let lastSongArtist = '';
+  let lastSongKey = '';
   let lastCoverBgSrc = '';
+
+  function computeSongKey(song) {
+    if (!song) return '';
+    return `${song.source || ''}:${song.id ?? ''}:${song.title || ''}:${song.artist || ''}`;
+  }
+
+  function updateLikeButton() {
+    if (!likeBtn) return;
+    const canLike = Boolean(snapshot.canLike);
+    const liked = Boolean(snapshot.liked);
+    likeBtn.disabled = !canLike;
+    likeBtn.classList.toggle('liked', liked);
+    likeBtn.title = !canLike
+      ? '当前曲目暂不支持点赞'
+      : (liked ? '取消喜欢' : '喜欢当前曲目');
+    likeBtn.setAttribute('aria-pressed', liked ? 'true' : 'false');
+  }
 
   bridge.onSnapshot((data) => {
     if (!data) return;
@@ -544,14 +570,13 @@
       applyTheme(data.theme);
     }
 
-    const currentTitle = data.song !== undefined ? (data.song?.title || '') : lastSongTitle;
-    const currentArtist = data.song !== undefined ? (data.song?.artist || '') : lastSongArtist;
-    const isSongChanged = Boolean(data.song && (currentTitle !== lastSongTitle || currentArtist !== lastSongArtist));
+    const hasSongField = data.song !== undefined;
+    const incomingKey = hasSongField ? computeSongKey(data.song) : lastSongKey;
+    const isSongChanged = hasSongField && incomingKey !== lastSongKey;
     const isLyricsLoaded = Boolean(data.lyrics !== undefined && data.lyrics !== snapshot.lyrics);
 
     if (isSongChanged) {
-      lastSongTitle = currentTitle;
-      lastSongArtist = currentArtist;
+      lastSongKey = incomingKey;
       resetMonotonicTrackers(typeof data.currentTime === 'number' ? data.currentTime : 0);
     } else if (isLyricsLoaded) {
       activeLineIndex = -999;
@@ -656,6 +681,8 @@
     }
 
     if (data.song !== undefined) snapshot.song = data.song;
+    if (data.liked !== undefined) snapshot.liked = Boolean(data.liked);
+    if (data.canLike !== undefined) snapshot.canLike = Boolean(data.canLike);
     if (data.playerState !== undefined) snapshot.playerState = nextState;
     snapshot.isAdvancing = nextAdvancing;
     if (data.duration !== undefined) snapshot.duration = data.duration;
@@ -689,6 +716,9 @@
 
     if (data.song !== undefined || data.duration !== undefined || data.lyrics !== undefined || data.settings !== undefined) {
       updateMetadata();
+    }
+    if (data.liked !== undefined || data.canLike !== undefined || data.song !== undefined) {
+      updateLikeButton();
     }
     if (data.playerState !== undefined) {
       updatePlayerState();
@@ -739,6 +769,7 @@
       coverImg.src = '';
       coverImg.style.opacity = '0';
       if (coverFallback) coverFallback.style.display = 'flex';
+      if (lyricsStage) lyricsStage.classList.add('single-row');
       lyricMain.textContent = '♪ 享受纯净旋律 ♪';
       setWipeCssProperty(100);
       lyricSub.textContent = '';
@@ -841,6 +872,28 @@
     return { index: -1, line: null, isInterlude: false };
   }
 
+  // Render static placeholder text (no lyrics, prelude, interlude, or idle) at full primary brightness
+  function renderStaticStagePlaceholder(isInterlude) {
+    const song = snapshot.song;
+    if (isInterlude && (snapshot.currentTime || 0) > 3) {
+      if (lyricsStage) lyricsStage.classList.add('single-row');
+      lyricMain.textContent = '♪ 间奏 ♪';
+      lyricSub.textContent = '';
+    } else if (song && song.title) {
+      lyricMain.textContent = song.title;
+      lyricSub.textContent = song.artist || '';
+      if (lyricsStage) {
+        if (song.artist) lyricsStage.classList.remove('single-row');
+        else lyricsStage.classList.add('single-row');
+      }
+    } else {
+      if (lyricsStage) lyricsStage.classList.add('single-row');
+      lyricMain.textContent = '♪ 享受纯净旋律 ♪';
+      lyricSub.textContent = '';
+    }
+    setWipeCssProperty(100);
+  }
+
   // Update Karaoke Lyric Line
   function updateLyrics(time, allowBackward = false) {
     const lyrics = snapshot.lyrics;
@@ -849,12 +902,8 @@
         activeLineIndex = -1;
         currentActiveLine = null;
         lastWipeLineIndex = -1;
-        lastWipePct = 0;
-        lyricMain.textContent = snapshot.song?.title
-          ? `${snapshot.song.title} - ${snapshot.song.artist || 'Folia'}`
-          : '♪ 享受纯净旋律 ♪';
-        setWipeCssProperty(0);
-        lyricSub.textContent = '';
+        lastWipePct = 100;
+        renderStaticStagePlaceholder(false);
       }
       return;
     }
@@ -877,24 +926,15 @@
       renderActiveLine(currentActiveLine, isInterlude);
     }
 
-    // High frequency continuous fluid wipe progress
-    updateContinuousLyricWipe(currentActiveLine, time, allowBackward);
+    if (currentActiveLine) {
+      updateContinuousLyricWipe(currentActiveLine, time, allowBackward);
+    }
   }
 
   // Render text for active line with clear hierarchy and micro-transition
   function renderActiveLine(line, isInterlude) {
     if (!line) {
-      if (lyricsStage) lyricsStage.classList.add('single-row');
-      const song = snapshot.song;
-      if (isInterlude && (snapshot.currentTime || 0) > 3) {
-        lyricMain.textContent = '♪ 间奏 ♪';
-      } else if (song && song.title) {
-        lyricMain.textContent = `${song.title} - ${song.artist || 'Folia'}`;
-      } else {
-        lyricMain.textContent = '♪ 享受纯净旋律 ♪';
-      }
-      setWipeCssProperty(0);
-      lyricSub.textContent = '';
+      renderStaticStagePlaceholder(isInterlude);
       return;
     }
 

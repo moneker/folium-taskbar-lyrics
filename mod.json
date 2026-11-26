@@ -2,11 +2,11 @@
   "folium": 2,
   "id": "taskbar-lyrics",
   "name": "任务栏抽屉歌词",
-  "version": "1.0.8",
+  "version": "1.0.9",
   "author": "moneker",
   "repository": "https://github.com/moneker/folium-taskbar-lyrics",
   "bugs": "https://github.com/moneker/folium-taskbar-lyrics/issues",
-  "description": "以抽屉式替换模式完全覆盖 Windows 任务栏的沉浸式动态歌词模组（仅限 Windows）。最左侧常驻替换按钮，点击后歌词抽屉从右侧丝滑滑入覆盖任务栏，支持鼠标悬停避让（Hover 隐藏穿透）、多显示器切换、实时逐字歌词、Folia流体封面背景与控制面板（通过 folium.omni 使用当前登录音源读取专辑与曲目元数据）。",
+  "description": "以抽屉式替换模式完全覆盖 Windows 任务栏的沉浸式动态歌词模组（仅限 Windows）。最左侧常驻透明微光开关，点击后歌词抽屉从右侧丝滑滑入，支持悬停避让、多显示器切换、实时逐字歌词、流体封面背景、任务栏红心点赞、分页播放队列、最近播放/快捷收藏，以及通过 folium.omni 以当前登录音源账号进行在线搜歌与当前曲目专辑/歌手浏览。",
   "main": "index.cjs",
   "client": "client.mjs",
   "preview": "preview.png",
@@ -16,7 +16,8 @@
   "permissions": [
     "playback.read",
     "playback.control",
-    "playback.queue"
+    "playback.queue",
+    "filesystem.data"
   ],
   "folia": ">=0.8.0"
 }

@@ -696,7 +696,7 @@ html, body {
   top: 50%;
   transform: translate(-50%, -50%);
   width: max-content;
-  max-width: calc(100% - 460px);
+  max-width: calc(100% - 496px);
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -889,6 +889,27 @@ html, body {
 
 .action-btn:active {
   transform: scale(0.92);
+}
+
+.like-btn.liked {
+  color: #fb7185;
+  filter: drop-shadow(0 0 6px rgba(251, 113, 133, 0.55));
+}
+
+.like-btn.liked svg {
+  fill: currentColor;
+}
+
+.like-btn:disabled {
+  opacity: 0.34;
+  cursor: default;
+  transform: none;
+}
+
+.like-btn:disabled:hover {
+  background: transparent;
+  color: var(--text-secondary);
+  transform: none;
 }
 
 .play-pause-btn {

@@ -1,122 +1,17 @@
 // mods/taskbar-lyrics/index.cjs
 // Main process entry for Taskbar Lyrics Drawer mod.
-// Calculates Windows taskbar geometry across multiple displays, manages the drawer overlay window,
-// coordinates hover-hide click-through behavior, and bridges playback actions securely.
+// Uses standard Electron screen and BrowserWindow APIs to calculate Windows taskbar geometry across displays,
+// manage the overlay drawer and floating control menu windows, guard topmost stacking, and follow host lifecycle.
 // Note: Supported exclusively on Windows (win32).
 
 'use strict';
 
-const fs = require('fs');
 const path = require('path');
 const { app, BrowserWindow, screen, ipcMain } = require('electron');
 
 const COLLAPSED_WIDTH = 56; // Width of the permanent left replacement button
-const VERTICAL_BAR_HEIGHT = 48; // Height of the floating capsule/bar when taskbar is vertical (left/right)
 const MAX_PENDING_ACTIONS = 50;
-const MENU_IDLE_DESTROY_MS = 10000; // Free menuWindow renderer process after 10s idle (reclaims ~45MB)
-
-const SHELL_WINDOW_CLASSES = new Set([
-  'Progman',
-  'WorkerW',
-  'Shell_TrayWnd',
-  'SecondaryTrayWnd',
-  'Windows.UI.Core.CoreWindow',
-  'XamlExplorerHostIslandWindow',
-  'MultitaskingViewFrame',
-  'ForegroundStaging',
-  'TaskListThumbnailWnd',
-  'NotifyIconOverflowWindow',
-]);
-
-let win32Inspector = null;
-let koffiLoadWarned = false;
-
-function loadKoffiModule() {
-  try {
-    return require('koffi');
-  } catch {}
-  try {
-    if (require.main && typeof require.main.require === 'function') {
-      return require.main.require('koffi');
-    }
-  } catch {}
-  const candidates = [];
-  if (typeof process.resourcesPath === 'string' && process.resourcesPath) {
-    candidates.push(path.join(process.resourcesPath, 'app.asar', 'node_modules', 'koffi'));
-    candidates.push(path.join(process.resourcesPath, 'app.asar.unpacked', 'node_modules', 'koffi'));
-  }
-  if (app && typeof app.getAppPath === 'function') {
-    try {
-      const appPath = app.getAppPath();
-      if (appPath) candidates.push(path.join(appPath, 'node_modules', 'koffi'));
-    } catch {}
-  }
-  for (const candidate of candidates) {
-    try {
-      return require(candidate);
-    } catch {}
-  }
-  return null;
-}
-
-function getWin32Inspector(log) {
-  if (win32Inspector !== null) return win32Inspector;
-  if (process.platform !== 'win32') {
-    win32Inspector = false;
-    return false;
-  }
-  try {
-    const koffi = loadKoffiModule();
-    if (!koffi) {
-      if (!koffiLoadWarned) {
-        koffiLoadWarned = true;
-        log?.warn?.('[taskbar-lyrics] Could not resolve native module "koffi"; Win32 taskbar positioning falls back to Electron bounds.');
-      }
-      win32Inspector = false;
-      return false;
-    }
-    const user32 = koffi.load('user32.dll');
-    const RectStruct = koffi.struct({
-      left: 'long',
-      top: 'long',
-      right: 'long',
-      bottom: 'long',
-    });
-    const MonitorInfoStruct = koffi.struct({
-      cbSize: 'uint32_t',
-      rcMonitor: RectStruct,
-      rcWork: RectStruct,
-      dwFlags: 'uint32_t',
-    });
-    win32Inspector = {
-      GetForegroundWindow: user32.func('GetForegroundWindow', 'intptr_t', []),
-      GetWindowRect: user32.func('GetWindowRect', 'bool', ['intptr_t', koffi.out(koffi.pointer(RectStruct))]),
-      GetClassNameW: user32.func('GetClassNameW', 'int', ['intptr_t', koffi.out(koffi.pointer('uint16_t')), 'int']),
-      IsWindowVisible: user32.func('IsWindowVisible', 'bool', ['intptr_t']),
-      GetWindowLongW: user32.func('GetWindowLongW', 'long', ['intptr_t', 'int']),
-      MonitorFromWindow: user32.func('MonitorFromWindow', 'intptr_t', ['intptr_t', 'uint32_t']),
-      GetMonitorInfoW: user32.func('GetMonitorInfoW', 'bool', ['intptr_t', koffi.inout(koffi.pointer(MonitorInfoStruct))]),
-      SetWindowPos: user32.func('SetWindowPos', 'bool', ['intptr_t', 'intptr_t', 'int', 'int', 'int', 'int', 'uint32_t']),
-      monitorInfoSize: koffi.sizeof(MonitorInfoStruct),
-      classNameBuf: Buffer.alloc(512),
-    };
-    return win32Inspector;
-  } catch {
-    win32Inspector = false;
-    return false;
-  }
-}
-
-function readNativeHwnd(win) {
-  try {
-    if (!win || win.isDestroyed()) return 0;
-    const buf = win.getNativeWindowHandle();
-    if (!Buffer.isBuffer(buf)) return 0;
-    if (buf.length >= 8) return Number(buf.readBigInt64LE(0));
-    if (buf.length >= 4) return buf.readInt32LE(0);
-  } catch {}
-  return 0;
-}
+const MENU_IDLE_DESTROY_MS = 10000; // Free menuWindow renderer process after 10s idle
 
 const TASKBAR_SNAPSHOT_KEYS = [
   'song',
@@ -124,16 +19,18 @@ const TASKBAR_SNAPSHOT_KEYS = [
   'isAdvancing',
   'currentTime',
   'duration',
-  'lyricOffsetMs',
   'updatedAt',
   'isSeek',
   'lyrics',
+  'liked',
+  'canLike',
   'theme',
   'settings',
   'displayInfo',
 ];
 
 const MENU_SNAPSHOT_KEYS = [
+  'song',
   'theme',
   'queue',
   'queueTotal',
@@ -143,20 +40,21 @@ const MENU_SNAPSHOT_KEYS = [
   'loopMode',
   'volume',
   'isMuted',
-  'librarySummary',
-  'libraryCategoryData',
-  'libraryDetailData',
   'settings',
   'displayInfo',
   'hasPlaybackControls',
+  'providers',
+  'searchState',
+  'exploreData',
+  'savedTracks',
+  'recentTracks',
 ];
 
 function normalizeRuntimeTheme(theme) {
   if (!theme || typeof theme !== 'object') return null;
-  const resolvedFont = theme.fontFamily
-    || (Array.isArray(theme.fontFamilyStack) && theme.fontFamilyStack.length > 0
-      ? theme.fontFamilyStack.join(', ')
-      : undefined);
+  const resolvedFont = (Array.isArray(theme.fontFamilyStack) && theme.fontFamilyStack.length > 0
+    ? theme.fontFamilyStack.join(', ')
+    : undefined) || theme.fontFamily;
   return {
     name: theme.name || 'Folia Theme',
     backgroundColor: theme.backgroundColor,
@@ -174,7 +72,6 @@ function normalizeRuntimeTheme(theme) {
  * @param {import('../folium').FoliumMainApi} api
  */
 module.exports = function activate(api) {
-  // Enforce Windows platform limitation
   if (process.platform !== 'win32') {
     api.log.info('Taskbar Lyrics mod is only supported on Windows (win32). Inactive on this platform.');
     return () => {};
@@ -183,16 +80,16 @@ module.exports = function activate(api) {
   api.log.info(`Activating Taskbar Lyrics mod (v${api.manifest.version})`);
 
   let isDisposed = false;
+  let isQuitting = false;
   let startupWindowTimer = null;
   let taskbarWindow = null;
   let menuWindow = null;
-  let isEnabled = true;
   let isDrawerExpanded = false;
   let interactionMode = 'standard'; // 'standard' | 'hover-hide'
-  let currentDisplayTarget = 'primary'; // 'primary' | 'secondary' | 'wallpaper' | 'display:<idx>'
+  let currentDisplayTarget = 'primary'; // 'primary' | 'secondary' | 'display:<idx>'
   let isHoverHidden = false;
   let isFullscreenHidden = false;
-  let verticalTaskbarOffsetY = null;
+  let lastSentWindowHidden = null;
 
   const pendingActions = [];
   let clientRpcReady = false;
@@ -202,12 +99,21 @@ module.exports = function activate(api) {
   let hostCloseCheckTimer = null;
   let isCreatingOwnedWindow = false;
   const topmostRetryTimers = new Set();
-  const pendingWindowInspectTimers = new Set();
-  const watchedHostWindows = new Map();
+  const seenVisibleHostWindows = new Set();
+  const watchedHostCleanups = new Map();
   let lastMenuBlurTime = 0;
 
+  function normalizeDisplayTarget(choice) {
+    if (typeof choice !== 'string' || !choice) return 'primary';
+    if (choice === 'wallpaper') return 'secondary';
+    if (choice === 'primary' || choice === 'secondary' || choice.startsWith('display:')) {
+      return choice;
+    }
+    return 'primary';
+  }
+
   function dispatchClientAction(actionObj) {
-    if (!actionObj || !actionObj.action) return;
+    if (!actionObj || !actionObj.action || isDisposed || isQuitting) return;
     if (clientRpcReady && typeof api.rpc?.send === 'function') {
       try {
         api.rpc.send('clientAction', actionObj);
@@ -219,36 +125,8 @@ module.exports = function activate(api) {
     }
   }
 
-  let cachedWallpaperDisplayChoice = null;
-  let lastWallpaperConfigReadAt = 0;
-
   /**
-   * Reads Folia's configured wallpaper display from userData/config.json if available.
-   */
-  function readFoliaWallpaperDisplayChoice() {
-    const now = Date.now();
-    if (now - lastWallpaperConfigReadAt < 2500) {
-      return cachedWallpaperDisplayChoice;
-    }
-    lastWallpaperConfigReadAt = now;
-    try {
-      if (!app || typeof app.getPath !== 'function') return null;
-      const configPath = path.join(app.getPath('userData'), 'config.json');
-      if (!fs.existsSync(configPath)) {
-        cachedWallpaperDisplayChoice = null;
-        return null;
-      }
-      const raw = fs.readFileSync(configPath, 'utf8');
-      const parsed = JSON.parse(raw);
-      cachedWallpaperDisplayChoice = parsed?.wallpaper_display || null;
-      return cachedWallpaperDisplayChoice;
-    } catch {
-      return cachedWallpaperDisplayChoice;
-    }
-  }
-
-  /**
-   * Resolves the target Electron Display object based on user preference.
+   * Resolves the target Electron Display object strictly via Electron screen APIs.
    * @param {string} [targetChoice]
    */
   function resolveTargetDisplay(targetChoice = currentDisplayTarget) {
@@ -259,7 +137,7 @@ module.exports = function activate(api) {
         return primaryDisplay;
       }
 
-      const choice = targetChoice || 'primary';
+      const choice = normalizeDisplayTarget(targetChoice);
       if (choice === 'primary') {
         return primaryDisplay;
       }
@@ -268,28 +146,7 @@ module.exports = function activate(api) {
         return allDisplays.find((d) => d.id !== primaryDisplay.id) || primaryDisplay;
       }
 
-      if (choice === 'wallpaper') {
-        const wp = readFoliaWallpaperDisplayChoice();
-        if (wp) {
-          if (Number.isInteger(wp.id) && wp.id > 0) {
-            const byId = allDisplays.find((d) => d.id === wp.id);
-            if (byId) return byId;
-          }
-          if (wp.bounds) {
-            const byBounds = allDisplays.find((d) => (
-              d.bounds
-              && d.bounds.x === wp.bounds.x
-              && d.bounds.y === wp.bounds.y
-              && d.bounds.width === wp.bounds.width
-              && d.bounds.height === wp.bounds.height
-            ));
-            if (byBounds) return byBounds;
-          }
-        }
-        return allDisplays.find((d) => d.id !== primaryDisplay.id) || primaryDisplay;
-      }
-
-      if (typeof choice === 'string' && choice.startsWith('display:')) {
+      if (choice.startsWith('display:')) {
         const token = choice.slice('display:'.length);
         const idx = parseInt(token, 10);
         if (Number.isInteger(idx) && idx >= 0 && idx < allDisplays.length) {
@@ -355,7 +212,6 @@ module.exports = function activate(api) {
   /**
    * Calculates the bounding rectangle of the Windows taskbar on the target display.
    * @param {Electron.Display} [targetDisplay]
-   * @returns {{ x: number, y: number, width: number, height: number, edge: 'bottom'|'top'|'left'|'right', orientation: 'horizontal'|'vertical' }}
    */
   function resolveTaskbarBounds(targetDisplay) {
     try {
@@ -363,7 +219,6 @@ module.exports = function activate(api) {
       const display = targetDisplay || resolveTargetDisplay();
       const { bounds, workArea } = display;
 
-      // Taskbar at the bottom of the screen (standard Windows configuration)
       if (workArea.y === bounds.y && workArea.height < bounds.height) {
         return {
           x: bounds.x,
@@ -375,7 +230,6 @@ module.exports = function activate(api) {
         };
       }
 
-      // Taskbar at the top
       if (workArea.y > bounds.y) {
         return {
           x: bounds.x,
@@ -387,7 +241,6 @@ module.exports = function activate(api) {
         };
       }
 
-      // Taskbar on the left
       if (workArea.x > bounds.x) {
         return {
           x: bounds.x,
@@ -399,7 +252,6 @@ module.exports = function activate(api) {
         };
       }
 
-      // Taskbar on the right
       if (workArea.x === bounds.x && workArea.width < bounds.width) {
         return {
           x: bounds.x + workArea.width,
@@ -411,8 +263,6 @@ module.exports = function activate(api) {
         };
       }
 
-      // Fallback (e.g., secondary monitor without workArea inset or auto-hide taskbar):
-      // Infer taskbar height from primary display if available, otherwise 48px.
       let defaultHeight = 48;
       if (primaryDisplay && primaryDisplay.bounds.height > primaryDisplay.workArea.height) {
         const primaryTbHeight = primaryDisplay.bounds.height - primaryDisplay.workArea.height;
@@ -434,10 +284,7 @@ module.exports = function activate(api) {
   }
 
   /**
-   * Resolves the actual BrowserWindow bounds for the drawer in collapsed or expanded state.
-   * For vertical taskbars (left/right):
-   * - Collapsed: `tb.width × 56px` capsule at the top (or user-dragged Y) so the rest of the taskbar stays clickable.
-   * - Expanded: full vertical taskbar (`tb.width × tb.height`) with vertical lyrics layout.
+   * Resolves the BrowserWindow bounds for the drawer in collapsed or expanded state.
    * @param {boolean} [expanded]
    * @param {Electron.Display} [targetDisplay]
    */
@@ -446,30 +293,11 @@ module.exports = function activate(api) {
     const tb = resolveTaskbarBounds(display);
 
     if (tb.orientation === 'vertical') {
-      if (expanded) {
-        return {
-          x: tb.x,
-          y: tb.y,
-          width: tb.width,
-          height: tb.height,
-          edge: tb.edge,
-          orientation: 'vertical',
-        };
-      }
-
-      const collapsedHeight = COLLAPSED_WIDTH;
-      const minY = tb.y;
-      const maxY = Math.max(minY, tb.y + tb.height - collapsedHeight);
-      const rawY = typeof verticalTaskbarOffsetY === 'number' && Number.isFinite(verticalTaskbarOffsetY)
-        ? verticalTaskbarOffsetY
-        : tb.y;
-      const y = Math.max(minY, Math.min(maxY, Math.round(rawY)));
-
       return {
         x: tb.x,
-        y,
+        y: tb.y,
         width: tb.width,
-        height: collapsedHeight,
+        height: expanded ? tb.height : COLLAPSED_WIDTH,
         edge: tb.edge,
         orientation: 'vertical',
       };
@@ -491,9 +319,10 @@ module.exports = function activate(api) {
     isAdvancing: false,
     currentTime: 0,
     duration: 0,
-    lyricOffsetMs: 0,
     updatedAt: Date.now(),
     lyrics: null,
+    liked: false,
+    canLike: false,
     theme: null,
     settings: {
       showTranslation: true,
@@ -505,6 +334,7 @@ module.exports = function activate(api) {
   };
 
   let latestMenuSnapshot = {
+    song: null,
     theme: null,
     queue: [],
     queueTotal: 0,
@@ -514,12 +344,14 @@ module.exports = function activate(api) {
     loopMode: 'all',
     volume: 100,
     isMuted: false,
-    librarySummary: null,
-    libraryCategoryData: null,
-    libraryDetailData: null,
     settings: latestTaskbarSnapshot.settings,
     displayInfo: latestTaskbarSnapshot.displayInfo,
     hasPlaybackControls: true,
+    providers: [],
+    searchState: null,
+    exploreData: null,
+    savedTracks: [],
+    recentTracks: [],
   };
 
   // Initialize playback snapshot from api.runtime if host has playback running
@@ -528,13 +360,17 @@ module.exports = function activate(api) {
       const snap = api.runtime.getPlaybackSnapshot();
       if (snap) {
         const initialTheme = normalizeRuntimeTheme(snap.theme);
+        const initialSong = snap.song ? {
+          id: snap.song.id ?? null,
+          source: snap.song.source ?? null,
+          title: snap.song.title || '未知曲目',
+          artist: snap.song.artist || 'Folia',
+          album: snap.song.album ?? null,
+          coverUrl: null,
+        } : null;
         latestTaskbarSnapshot = {
           ...latestTaskbarSnapshot,
-          song: snap.song ? {
-            title: snap.song.title || '未知曲目',
-            artist: snap.song.artist || 'Folia',
-            coverUrl: null,
-          } : null,
+          song: initialSong,
           playerState: snap.state || 'paused',
           currentTime: typeof snap.position === 'number' ? snap.position : 0,
           duration: typeof snap.duration === 'number' ? snap.duration : 0,
@@ -560,6 +396,7 @@ module.exports = function activate(api) {
         };
         latestMenuSnapshot = {
           ...latestMenuSnapshot,
+          song: initialSong,
           volume: typeof snap.volume === 'number' ? Math.round(snap.volume * 100) : 100,
           isMuted: Boolean(snap.muted),
           loopMode: snap.loopMode || 'all',
@@ -572,21 +409,42 @@ module.exports = function activate(api) {
   }
 
   /**
-   * Detects whether a fullscreen application is currently active on the target display.
-   * @param {Electron.Display} [targetDisplay]
-   * @param {boolean} [wasFullscreen]
+   * Synchronizes window mouse pass-through and renderer hidden state from a single truth
+   * (`isFullscreenHidden || isHoverHidden`) so fullscreen avoidance and hover-hide never conflict.
+   * @param {boolean} [forceSend]
    */
-  function isTargetDisplayFullscreen(targetDisplay, wasFullscreen = false) {
+  function syncWindowVisibility(forceSend = false) {
+    if (!taskbarWindow || taskbarWindow.isDestroyed()) return;
+    const shouldHide = Boolean(isFullscreenHidden || isHoverHidden);
+    try {
+      if (shouldHide) {
+        taskbarWindow.setIgnoreMouseEvents(true, { forward: true });
+      } else {
+        taskbarWindow.setIgnoreMouseEvents(false);
+      }
+    } catch {}
+    if (forceSend || lastSentWindowHidden !== shouldHide) {
+      lastSentWindowHidden = shouldHide;
+      try {
+        taskbarWindow.webContents.send('taskbar-lyrics:hover-hidden', shouldHide);
+      } catch {}
+    }
+  }
+
+  /**
+   * Detects whether an Electron window (e.g. Folia in fullscreen mode) occupies the target display.
+   * @param {Electron.Display} [targetDisplay]
+   */
+  function isTargetDisplayFullscreen(targetDisplay) {
     try {
       const display = targetDisplay || resolveTargetDisplay();
       if (!display || !display.bounds) return false;
 
-      // 1. Check Electron windows (e.g. Folia itself in fullscreen mode on this display)
       const allWindows = BrowserWindow.getAllWindows();
       for (let i = 0; i < allWindows.length; i++) {
         const w = allWindows[i];
-        if (!w || w.isDestroyed() || w === taskbarWindow || w === menuWindow) continue;
-        if (w.isVisible() && w.isFullScreen()) {
+        if (!w || w.isDestroyed() || w === taskbarWindow || w === menuWindow || w.__foliaTaskbarLyricsOwned) continue;
+        if (typeof w.isVisible === 'function' && typeof w.isFullScreen === 'function' && w.isVisible() && w.isFullScreen()) {
           try {
             const matched = screen.getDisplayMatching(w.getBounds());
             if (matched && matched.id === display.id) {
@@ -596,135 +454,65 @@ module.exports = function activate(api) {
         }
       }
 
-      // 2. Check active Win32 foreground window via user32.dll
-      const inspector = getWin32Inspector();
-      if (!inspector) return false;
-
-      const hwnd = inspector.GetForegroundWindow();
-      if (!hwnd) return wasFullscreen;
-
-      if (hwnd === readNativeHwnd(taskbarWindow) || hwnd === readNativeHwnd(menuWindow)) {
-        return false;
-      }
-
-      if (!inspector.IsWindowVisible(hwnd)) return false;
-
-      const len = inspector.GetClassNameW(hwnd, inspector.classNameBuf, 255);
-      const className = len > 0 ? inspector.classNameBuf.toString('utf16le', 0, len * 2) : '';
-      if (SHELL_WINDOW_CLASSES.has(className)) return false;
-
-      const rect = { left: 0, top: 0, right: 0, bottom: 0 };
-      if (!inspector.GetWindowRect(hwnd, rect)) return false;
-      if (rect.right <= rect.left || rect.bottom <= rect.top) return false;
-
-      // Resolve Win32 monitor bounds in the exact same coordinate space as GetWindowRect
-      const MONITOR_DEFAULTTONEAREST = 2;
-      const fgMon = inspector.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-      if (!fgMon) return false;
-
-      const taskbarHwnd = readNativeHwnd(taskbarWindow);
-      if (taskbarHwnd) {
-        const tbMon = inspector.MonitorFromWindow(taskbarHwnd, MONITOR_DEFAULTTONEAREST);
-        if (tbMon && fgMon !== tbMon) {
-          return false;
-        }
-      }
-
-      const mi = { cbSize: inspector.monitorInfoSize };
-      if (!inspector.GetMonitorInfoW(fgMon, mi) || !mi.rcMonitor) return false;
-      const monRect = mi.rcMonitor;
-
-      const tol = 2;
-      const coversDisplay = (
-        rect.left <= monRect.left + tol
-        && rect.top <= monRect.top + tol
-        && rect.right >= monRect.right - tol
-        && rect.bottom >= monRect.bottom - tol
-      );
-      if (!coversDisplay) return false;
-
-      // On auto-hide taskbars (rcWork equals rcMonitor), distinguish a normal maximized window
-      // with a title bar (WS_MAXIMIZE | WS_CAPTION) from a true fullscreen window.
-      const workRect = mi.rcWork || monRect;
-      const isAutoHideTaskbar = (
-        workRect.left === monRect.left
-        && workRect.top === monRect.top
-        && workRect.right === monRect.right
-        && workRect.bottom === monRect.bottom
-      );
-      if (isAutoHideTaskbar) {
-        const GWL_STYLE = -16;
-        const WS_MAXIMIZE = 0x01000000;
-        const WS_CAPTION = 0x00C00000;
-        const style = inspector.GetWindowLongW(hwnd, GWL_STYLE);
-        if ((style & WS_MAXIMIZE) !== 0 && (style & WS_CAPTION) !== 0) {
-          return false;
-        }
-      }
-
-      return true;
+      return false;
     } catch {
       return false;
     }
   }
 
   /**
-   * Hides the taskbar lyrics window (opacity 0 + mouse click-through) while a fullscreen
-   * application occupies the target display, and restores interactive Z-order once fullscreen ends.
+   * Schedules short follow-up topmost re-assertions after blur/fullscreen exit so Windows
+   * taskbar activation (Shell_TrayWnd) cannot leave our overlay behind it for 600ms.
+   * @param {number[]} delays
+   * @param {boolean} [forceReset]
+   */
+  function scheduleTopmostReassert(delays = [35, 160], forceReset = false) {
+    delays.forEach((delayMs) => {
+      const timer = setTimeout(() => {
+        topmostRetryTimers.delete(timer);
+        if (!isDisposed && !isQuitting && !isFullscreenHidden && !isHoverHidden) {
+          assertTopmost(forceReset);
+        }
+      }, delayMs);
+      topmostRetryTimers.add(timer);
+    });
+  }
+
+  /**
+   * Hides the taskbar lyrics window while an Electron fullscreen window occupies the target display,
+   * and restores interactive Z-order once fullscreen ends.
    */
   function syncFullscreenAvoidance() {
-    if (!taskbarWindow || taskbarWindow.isDestroyed() || !isEnabled) return false;
+    if (!taskbarWindow || taskbarWindow.isDestroyed() || isDisposed || isQuitting) return false;
     const display = resolveTargetDisplay();
-    const fullscreenActive = isTargetDisplayFullscreen(display, isFullscreenHidden);
+    const fullscreenActive = isTargetDisplayFullscreen(display);
     if (fullscreenActive) {
       if (!isFullscreenHidden) {
         isFullscreenHidden = true;
         closeMenuWindow();
-        try {
-          taskbarWindow.setIgnoreMouseEvents(true, { forward: true });
-        } catch {}
-        try {
-          taskbarWindow.webContents.send('taskbar-lyrics:hover-hidden', true);
-        } catch {}
+        syncWindowVisibility();
       }
       return true;
     }
 
     if (isFullscreenHidden) {
       isFullscreenHidden = false;
+      syncWindowVisibility();
       if (!isHoverHidden) {
-        try {
-          taskbarWindow.setIgnoreMouseEvents(false);
-        } catch {}
-        try {
-          taskbarWindow.webContents.send('taskbar-lyrics:hover-hidden', false);
-        } catch {}
+        assertTopmost(true);
+        scheduleTopmostReassert([150, 450], true);
       }
-      assertTopmost(true);
-      const retryShort = setTimeout(() => {
-        topmostRetryTimers.delete(retryShort);
-        if (!isDisposed && !isFullscreenHidden && !isHoverHidden) {
-          assertTopmost(true);
-        }
-      }, 150);
-      topmostRetryTimers.add(retryShort);
-      const retryLong = setTimeout(() => {
-        topmostRetryTimers.delete(retryLong);
-        if (!isDisposed && !isFullscreenHidden && !isHoverHidden) {
-          assertTopmost(true);
-        }
-      }, 450);
-      topmostRetryTimers.add(retryLong);
     }
     return false;
   }
 
   /**
-   * Asserts the window to floating level above Windows taskbar (Shell_TrayWnd).
+   * Asserts the window above Windows taskbar using pure Electron BrowserWindow APIs
+   * (`screen-saver` level with explicit relativeLevel 1 + `moveTop`).
    * @param {boolean} [forceReset]
    */
   function assertTopmost(forceReset = false) {
-    if (!taskbarWindow || taskbarWindow.isDestroyed() || !isEnabled) return;
+    if (!taskbarWindow || taskbarWindow.isDestroyed() || isDisposed || isQuitting) return;
     if (isHoverHidden || isFullscreenHidden) return;
     try {
       if (!taskbarWindow.isVisible()) {
@@ -732,15 +520,9 @@ module.exports = function activate(api) {
       }
       if (forceReset) {
         taskbarWindow.setAlwaysOnTop(false);
-        taskbarWindow.setAlwaysOnTop(true, 'screen-saver');
-      } else if (!taskbarWindow.isAlwaysOnTop()) {
-        taskbarWindow.setAlwaysOnTop(true, 'screen-saver');
-      }
-      const inspector = getWin32Inspector();
-      const hwnd = readNativeHwnd(taskbarWindow);
-      if (inspector && hwnd) {
-        // HWND_TOPMOST = -1, SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE = 0x0013
-        inspector.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x0013);
+        taskbarWindow.setAlwaysOnTop(true, 'screen-saver', 1);
+      } else {
+        taskbarWindow.setAlwaysOnTop(true, 'screen-saver', 1);
       }
       if (typeof taskbarWindow.moveTop === 'function') {
         taskbarWindow.moveTop();
@@ -772,23 +554,18 @@ module.exports = function activate(api) {
    * Activates hover-hide click-through so the user can interact with the native Windows taskbar underneath.
    */
   function enterHoverHide() {
-    if (interactionMode !== 'hover-hide' || !isEnabled) return;
+    if (interactionMode !== 'hover-hide' || isDisposed || isQuitting) return;
     if (!taskbarWindow || taskbarWindow.isDestroyed()) return;
 
     if (!isHoverHidden) {
       isHoverHidden = true;
       closeMenuWindow();
-      try {
-        taskbarWindow.setIgnoreMouseEvents(true, { forward: true });
-      } catch {}
-      try {
-        taskbarWindow.webContents.send('taskbar-lyrics:hover-hidden', true);
-      } catch {}
+      syncWindowVisibility();
     }
 
     if (!hoverWatchTimer) {
       hoverWatchTimer = setInterval(() => {
-        if (!taskbarWindow || taskbarWindow.isDestroyed() || !isEnabled || interactionMode !== 'hover-hide') {
+        if (!taskbarWindow || taskbarWindow.isDestroyed() || isDisposed || isQuitting || interactionMode !== 'hover-hide') {
           leaveHoverHide();
           return;
         }
@@ -800,7 +577,8 @@ module.exports = function activate(api) {
   }
 
   /**
-   * Restores the taskbar lyrics window once the mouse cursor leaves the taskbar area.
+   * Restores the taskbar lyrics window once the mouse cursor leaves the taskbar area,
+   * while respecting active fullscreen avoidance.
    */
   function leaveHoverHide() {
     if (hoverWatchTimer) {
@@ -809,13 +587,9 @@ module.exports = function activate(api) {
     }
     if (isHoverHidden) {
       isHoverHidden = false;
-      if (taskbarWindow && !taskbarWindow.isDestroyed()) {
-        try {
-          taskbarWindow.setIgnoreMouseEvents(false);
-        } catch {}
-        try {
-          taskbarWindow.webContents.send('taskbar-lyrics:hover-hidden', false);
-        } catch {}
+      syncFullscreenAvoidance();
+      syncWindowVisibility();
+      if (!isFullscreenHidden) {
         assertTopmost();
       }
     }
@@ -825,8 +599,8 @@ module.exports = function activate(api) {
     const display = resolveTargetDisplay();
     const drawerBounds = resolveDrawerWindowBounds(true, display);
     const dispBounds = display?.bounds || { x: 0, y: 0, width: 1920, height: 1080 };
-    const menuWidth = 360;
-    const menuHeight = 460;
+    const menuWidth = 384;
+    const menuHeight = 500;
     const margin = 12;
 
     if (drawerBounds.orientation === 'vertical') {
@@ -858,9 +632,8 @@ module.exports = function activate(api) {
   }
 
   /**
-   * Applies bounds to the frameless non-resizable taskbar window, opening min/max size constraints
-   * first and snapping expanded vertical/horizontal bounds to exact Win32 physical monitor edges.
-   * @param {{ x: number, y: number, width: number, height: number, edge?: string, orientation?: string }} winBounds
+   * Applies bounds to the frameless non-resizable taskbar window using Electron BrowserWindow APIs.
+   * @param {{ x: number, y: number, width: number, height: number }} winBounds
    */
   function applyTaskbarWindowBounds(winBounds) {
     if (!taskbarWindow || taskbarWindow.isDestroyed() || !winBounds) return;
@@ -875,52 +648,6 @@ module.exports = function activate(api) {
       taskbarWindow.setMaximumSize(10000, 10000);
     } catch {}
     taskbarWindow.setBounds(target);
-
-    if (isDrawerExpanded) {
-      try {
-        const inspector = getWin32Inspector();
-        const hwnd = readNativeHwnd(taskbarWindow);
-        if (inspector && hwnd) {
-          const MONITOR_DEFAULTTONEAREST = 2;
-          const hMon = inspector.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-          const mi = { cbSize: inspector.monitorInfoSize };
-          if (hMon && inspector.GetMonitorInfoW(hMon, mi) && mi.rcMonitor && mi.rcWork) {
-            const mon = mi.rcMonitor;
-            const work = mi.rcWork;
-            const scaleFactor = resolveTargetDisplay()?.scaleFactor || 1;
-            let physX = mon.left;
-            let physY = mon.top;
-            let physW = mon.right - mon.left;
-            let physH = mon.bottom - mon.top;
-
-            if (winBounds.orientation === 'vertical') {
-              physY = mon.top;
-              physH = mon.bottom - mon.top;
-              if (winBounds.edge === 'left') {
-                physX = mon.left;
-                physW = work.left > mon.left ? (work.left - mon.left) : Math.max(48, Math.round(target.width * scaleFactor));
-              } else {
-                physW = mon.right > work.right ? (mon.right - work.right) : Math.max(48, Math.round(target.width * scaleFactor));
-                physX = mon.right - physW;
-              }
-            } else if (winBounds.edge === 'top') {
-              physX = mon.left;
-              physY = mon.top;
-              physW = mon.right - mon.left;
-              physH = work.top > mon.top ? (work.top - mon.top) : Math.max(40, Math.round(target.height * scaleFactor));
-            } else {
-              physX = mon.left;
-              physW = mon.right - mon.left;
-              physH = mon.bottom > work.bottom ? (mon.bottom - work.bottom) : Math.max(40, Math.round(target.height * scaleFactor));
-              physY = mon.bottom - physH;
-            }
-
-            // HWND_TOPMOST = -1, SWP_NOACTIVATE = 0x0010
-            inspector.SetWindowPos(hwnd, -1, physX, physY, physW, physH, 0x0010);
-          }
-        }
-      } catch {}
-    }
   }
 
   function repositionWindowsToActiveDisplay() {
@@ -995,9 +722,7 @@ module.exports = function activate(api) {
     if (!settings || typeof settings !== 'object') return;
 
     const nextMode = settings.interactionMode === 'hover-hide' ? 'hover-hide' : 'standard';
-    const nextDisplay = typeof settings.targetDisplay === 'string' && settings.targetDisplay
-      ? settings.targetDisplay
-      : currentDisplayTarget;
+    const nextDisplay = normalizeDisplayTarget(settings.targetDisplay || currentDisplayTarget);
 
     const displayChanged = nextDisplay !== currentDisplayTarget;
     const modeChanged = nextMode !== interactionMode;
@@ -1042,6 +767,7 @@ module.exports = function activate(api) {
   }
 
   function createMenuWindow() {
+    if (isDisposed || isQuitting) return null;
     clearMenuDestroyTimer();
     if (menuWindow && !menuWindow.isDestroyed()) {
       return menuWindow;
@@ -1079,19 +805,26 @@ module.exports = function activate(api) {
       isCreatingOwnedWindow = false;
     }
 
-    win.setAlwaysOnTop(true, 'screen-saver');
+    win.setAlwaysOnTop(true, 'screen-saver', 1);
     if (typeof win.setVisibleOnAllWorkspaces === 'function') {
       win.setVisibleOnAllWorkspaces(true);
     }
 
-    win.loadFile(path.join(__dirname, 'view', 'menu.html'));
+    const pushMenuState = () => {
+      if (win.isDestroyed() || isDisposed || isQuitting) return;
+      latestMenuSnapshot.displayInfo = buildDisplayInfo();
+      try {
+        win.webContents.send('taskbar-lyrics:snapshot', latestMenuSnapshot);
+      } catch {}
+    };
+
+    win.webContents.on('did-finish-load', pushMenuState);
 
     win.once('ready-to-show', () => {
-      if (!win.isDestroyed()) {
+      if (!win.isDestroyed() && !isDisposed && !isQuitting) {
         win.show();
         win.focus();
-        latestMenuSnapshot.displayInfo = buildDisplayInfo();
-        win.webContents.send('taskbar-lyrics:snapshot', latestMenuSnapshot);
+        pushMenuState();
       }
     });
 
@@ -1101,19 +834,25 @@ module.exports = function activate(api) {
     });
 
     win.on('closed', () => {
-      clearMenuDestroyTimer();
-      menuWindow = null;
+      if (menuWindow === win) {
+        clearMenuDestroyTimer();
+        menuWindow = null;
+      }
     });
+
+    win.loadFile(path.join(__dirname, 'view', 'menu.html'));
 
     menuWindow = win;
     return win;
   }
 
   function showMenuWindow() {
+    if (isDisposed || isQuitting) return null;
     clearMenuDestroyTimer();
     if (menuWindow && !menuWindow.isDestroyed()) {
       const bounds = resolveMenuBounds();
       menuWindow.setBounds(bounds);
+      menuWindow.setAlwaysOnTop(true, 'screen-saver', 1);
       menuWindow.show();
       menuWindow.focus();
       latestMenuSnapshot.displayInfo = buildDisplayInfo();
@@ -1124,12 +863,12 @@ module.exports = function activate(api) {
   }
 
   function toggleMenuWindow() {
+    if (isDisposed || isQuitting) return;
     const now = Date.now();
     if (menuWindow && !menuWindow.isDestroyed() && menuWindow.isVisible()) {
       closeMenuWindow();
       return;
     }
-    // Prevent toggle bounce: if the menu just blurred within 350ms, the toggle click caused the blur.
     if (now - lastMenuBlurTime < 350) {
       return;
     }
@@ -1137,21 +876,8 @@ module.exports = function activate(api) {
   }
 
   function closeMenuWindow() {
-    const wasVisible = Boolean(menuWindow && !menuWindow.isDestroyed() && menuWindow.isVisible());
-    const hadCachedLibrary = Boolean(
-      latestMenuSnapshot.libraryCategoryData || latestMenuSnapshot.libraryDetailData,
-    );
-
-    // Drop cached heavy library lists from main process snapshot when menu closes
-    latestMenuSnapshot.libraryCategoryData = null;
-    latestMenuSnapshot.libraryDetailData = null;
-
-    if (wasVisible || hadCachedLibrary) {
-      dispatchClientAction({ action: 'releaseMenuMemory' });
-    }
-
     if (menuWindow && !menuWindow.isDestroyed()) {
-      if (wasVisible) {
+      if (menuWindow.isVisible()) {
         try {
           menuWindow.webContents.send('taskbar-lyrics:menu-closed');
         } catch {}
@@ -1165,7 +891,7 @@ module.exports = function activate(api) {
    * Expands the drawer: resizes the window to full taskbar width and animates.
    */
   function expandDrawer() {
-    if (!taskbarWindow || taskbarWindow.isDestroyed() || !isEnabled) return;
+    if (!taskbarWindow || taskbarWindow.isDestroyed() || isDisposed || isQuitting) return;
     if (isDrawerExpanded) return;
 
     if (collapseTimer) {
@@ -1185,7 +911,7 @@ module.exports = function activate(api) {
    * Collapses the drawer: notifies view to slide out, then resizes back to 56px.
    */
   function collapseDrawer() {
-    if (!taskbarWindow || taskbarWindow.isDestroyed() || !isEnabled) return;
+    if (!taskbarWindow || taskbarWindow.isDestroyed() || isDisposed || isQuitting) return;
     if (!isDrawerExpanded || interactionMode === 'hover-hide') return;
 
     closeMenuWindow();
@@ -1195,6 +921,7 @@ module.exports = function activate(api) {
 
     if (collapseTimer) clearTimeout(collapseTimer);
     collapseTimer = setTimeout(() => {
+      collapseTimer = null;
       if (taskbarWindow && !taskbarWindow.isDestroyed() && !isDrawerExpanded) {
         const winBounds = resolveDrawerWindowBounds(false);
         applyTaskbarWindowBounds(winBounds);
@@ -1204,7 +931,8 @@ module.exports = function activate(api) {
   }
 
   function toggleDrawer() {
-    if ((!taskbarWindow || taskbarWindow.isDestroyed()) && isEnabled && !isDisposed) {
+    if (isDisposed || isQuitting) return;
+    if (!taskbarWindow || taskbarWindow.isDestroyed()) {
       createWindow();
     }
     if (isDrawerExpanded) {
@@ -1215,6 +943,7 @@ module.exports = function activate(api) {
   }
 
   function createWindow() {
+    if (isDisposed || isQuitting) return null;
     if (taskbarWindow && !taskbarWindow.isDestroyed()) {
       return taskbarWindow;
     }
@@ -1254,70 +983,89 @@ module.exports = function activate(api) {
       isCreatingOwnedWindow = false;
     }
 
-    win.setAlwaysOnTop(true, 'screen-saver');
+    win.setAlwaysOnTop(true, 'screen-saver', 1);
     if (typeof win.setVisibleOnAllWorkspaces === 'function') {
       win.setVisibleOnAllWorkspaces(true);
     }
 
-    win.loadFile(path.join(__dirname, 'view', 'taskbar.html'));
+    const syncLoadedView = () => {
+      if (win.isDestroyed() || isDisposed || isQuitting) return;
+      latestTaskbarSnapshot.displayInfo = buildDisplayInfo();
+      try {
+        win.webContents.send('taskbar-lyrics:state', isDrawerExpanded ? 'expanded' : 'collapsed');
+        win.webContents.send('taskbar-lyrics:snapshot', latestTaskbarSnapshot);
+      } catch {}
+      syncWindowVisibility(true);
+    };
+
+    win.webContents.on('did-finish-load', syncLoadedView);
 
     win.once('ready-to-show', () => {
-      if (!win.isDestroyed()) {
-        applyTaskbarWindowBounds(resolveDrawerWindowBounds(isDrawerExpanded));
-        if (!syncFullscreenAvoidance() && isEnabled) {
-          assertTopmost();
-          win.showInactive();
-        }
-        win.webContents.send('taskbar-lyrics:state', isDrawerExpanded ? 'expanded' : 'collapsed');
-        latestTaskbarSnapshot.displayInfo = buildDisplayInfo();
-        win.webContents.send('taskbar-lyrics:snapshot', latestTaskbarSnapshot);
-        if (interactionMode === 'hover-hide') {
-          if (!isDrawerExpanded) expandDrawer();
-          if (isCursorInsideTaskbar(0)) enterHoverHide();
-        }
+      if (win.isDestroyed() || isDisposed || isQuitting) return;
+      applyTaskbarWindowBounds(resolveDrawerWindowBounds(isDrawerExpanded));
+      const fullscreenNow = syncFullscreenAvoidance();
+      if (!fullscreenNow && !isHoverHidden) {
+        assertTopmost();
+        win.showInactive();
+      } else if (!win.isVisible()) {
+        win.showInactive();
+      }
+      syncLoadedView();
+      if (interactionMode === 'hover-hide') {
+        if (!isDrawerExpanded) expandDrawer();
+        if (isCursorInsideTaskbar(0)) enterHoverHide();
       }
     });
 
     win.on('minimize', () => {
-      if (taskbarWindow && !taskbarWindow.isDestroyed() && isEnabled && !isFullscreenHidden) {
+      if (taskbarWindow && !taskbarWindow.isDestroyed() && !isDisposed && !isQuitting && !isFullscreenHidden) {
         taskbarWindow.restore();
         assertTopmost();
       }
     });
 
     win.on('blur', () => {
-      if (taskbarWindow && !taskbarWindow.isDestroyed() && isEnabled && !isHoverHidden) {
-        if (!syncFullscreenAvoidance()) {
-          taskbarWindow.moveTop();
+      if (taskbarWindow && !taskbarWindow.isDestroyed() && !isDisposed && !isQuitting) {
+        const fullscreenNow = syncFullscreenAvoidance();
+        if (!fullscreenNow && !isHoverHidden) {
+          assertTopmost(false);
+          scheduleTopmostReassert([35, 160], false);
         }
       }
     });
 
     win.webContents.on('render-process-gone', (_event, details) => {
-      api.log.warn(`Taskbar lyrics renderer process gone (${details.reason}), recreating window...`);
-      if (taskbarWindow && !taskbarWindow.isDestroyed()) {
-        try { taskbarWindow.destroy(); } catch {}
-      }
+      if (isDisposed || isQuitting || details?.reason === 'clean-exit' || taskbarWindow !== win) return;
+      api.log.warn(`Taskbar lyrics renderer process gone (${details?.reason || 'unknown'}), recreating window...`);
       taskbarWindow = null;
-      if (isEnabled) {
+      lastSentWindowHidden = null;
+      if (!win.isDestroyed()) {
+        try { win.destroy(); } catch {}
+      }
+      if (!isDisposed && !isQuitting) {
         createWindow();
       }
     });
 
     win.on('unresponsive', () => {
+      if (isDisposed || isQuitting || taskbarWindow !== win) return;
       api.log.warn('Taskbar lyrics window unresponsive, reloading webContents...');
-      if (taskbarWindow && !taskbarWindow.isDestroyed()) {
-        try { taskbarWindow.webContents.reload(); } catch {}
+      if (!win.isDestroyed()) {
+        try { win.webContents.reload(); } catch {}
       }
     });
 
     win.on('closed', () => {
+      if (taskbarWindow !== win) return;
       taskbarWindow = null;
+      lastSentWindowHidden = null;
       clearMenuDestroyTimer();
       if (menuWindow && !menuWindow.isDestroyed()) {
         menuWindow.close();
       }
     });
+
+    win.loadFile(path.join(__dirname, 'view', 'taskbar.html'));
 
     taskbarWindow = win;
     return win;
@@ -1344,6 +1092,10 @@ module.exports = function activate(api) {
   const onAnimationDone = (event, finalState) => {
     if (!isAuthorizedSender(event)) return;
     if (finalState === 'collapsed' && !isDrawerExpanded) {
+      if (collapseTimer) {
+        clearTimeout(collapseTimer);
+        collapseTimer = null;
+      }
       if (taskbarWindow && !taskbarWindow.isDestroyed()) {
         const winBounds = resolveDrawerWindowBounds(false);
         applyTaskbarWindowBounds(winBounds);
@@ -1364,37 +1116,14 @@ module.exports = function activate(api) {
   const onCloseMenu = (event) => {
     if (isAuthorizedSender(event)) closeMenuWindow();
   };
-
   const onAssertTop = (event) => {
     if (isAuthorizedSender(event)) assertTopmost();
   };
-
   const onHoverEnter = (event) => {
     if (isAuthorizedSender(event)) enterHoverHide();
   };
-
   const onSwitchDisplay = (event) => {
     if (isAuthorizedSender(event)) cycleTargetDisplay();
-  };
-
-  const onMoveVertical = (event, targetY) => {
-    if (!isAuthorizedSender(event)) return;
-    if (typeof targetY !== 'number' || !Number.isFinite(targetY)) return;
-    verticalTaskbarOffsetY = Math.round(targetY);
-    if (taskbarWindow && !taskbarWindow.isDestroyed()) {
-      const winBounds = resolveDrawerWindowBounds(isDrawerExpanded);
-      if (winBounds.orientation === 'vertical') {
-        taskbarWindow.setBounds({
-          x: winBounds.x,
-          y: winBounds.y,
-          width: winBounds.width,
-          height: winBounds.height,
-        });
-        if (menuWindow && !menuWindow.isDestroyed() && menuWindow.isVisible()) {
-          menuWindow.setBounds(resolveMenuBounds());
-        }
-      }
-    }
   };
 
   ipcMain.on('taskbar-lyrics:toggle', onToggleDrawer);
@@ -1407,7 +1136,6 @@ module.exports = function activate(api) {
   ipcMain.on('taskbar-lyrics:assert-top', onAssertTop);
   ipcMain.on('taskbar-lyrics:hover-enter', onHoverEnter);
   ipcMain.on('taskbar-lyrics:switch-display', onSwitchDisplay);
-  ipcMain.on('taskbar-lyrics:move-vertical', onMoveVertical);
 
   // Screen metrics & hotplug listeners
   const onDisplayChanged = () => {
@@ -1453,10 +1181,6 @@ module.exports = function activate(api) {
     for (let i = 0; i < MENU_SNAPSHOT_KEYS.length; i++) {
       const k = MENU_SNAPSHOT_KEYS[i];
       if (Object.prototype.hasOwnProperty.call(snapshot, k)) {
-        // Avoid retaining large category/detail song arrays in main process when menu is hidden
-        if (!isMenuVisible && (k === 'libraryCategoryData' || k === 'libraryDetailData')) {
-          continue;
-        }
         menuDelta[k] = snapshot[k];
         hasMenuDelta = true;
       }
@@ -1473,6 +1197,7 @@ module.exports = function activate(api) {
   });
 
   api.rpc.handle('drainActions', () => {
+    clientRpcReady = true;
     if (pendingActions.length === 0) return [];
     return pendingActions.splice(0, pendingActions.length);
   });
@@ -1484,47 +1209,30 @@ module.exports = function activate(api) {
   api.rpc.handle('collapseDrawer', () => collapseDrawer());
   api.rpc.handle('getStatus', () => ({
     isOpen: Boolean(taskbarWindow && !taskbarWindow.isDestroyed()),
-    isEnabled,
+    isEnabled: !isDisposed && !isQuitting,
     isExpanded: isDrawerExpanded,
     interactionMode,
     displayInfo: buildDisplayInfo(),
   }));
 
-  // Seed Win32 inspector with mod logger so missing koffi is reported once
-  getWin32Inspector(api.log);
-
-  let sawTaggedMainWindow = false;
-
-  function noteWindowTag(win) {
-    if (win && typeof win.__wallpaperGeometry === 'boolean') {
-      sawTaggedMainWindow = true;
-    }
+  function isNonOwnedWindow(win) {
+    return Boolean(
+      win
+      && typeof win.isDestroyed === 'function'
+      && !win.isDestroyed()
+      && win !== taskbarWindow
+      && win !== menuWindow
+      && !win.__foliaTaskbarLyricsOwned,
+    );
   }
 
-  function isHostBrowserWindow(win) {
-    if (
-      !win
-      || typeof win.isDestroyed !== 'function'
-      || win.isDestroyed()
-      || win === taskbarWindow
-      || win === menuWindow
-      || win.__foliaTaskbarLyricsOwned
-    ) {
-      return false;
+  function hasLiveHostWindow() {
+    for (const win of Array.from(seenVisibleHostWindows)) {
+      if (!win || typeof win.isDestroyed !== 'function' || win.isDestroyed()) {
+        seenVisibleHostWindows.delete(win);
+      }
     }
-    noteWindowTag(win);
-    if (sawTaggedMainWindow) {
-      return typeof win.__wallpaperGeometry === 'boolean';
-    }
-    return true;
-  }
-
-  function hasHostBrowserWindow() {
-    try {
-      return BrowserWindow.getAllWindows().some(isHostBrowserWindow);
-    } catch {
-      return false;
-    }
+    return seenVisibleHostWindows.size > 0;
   }
 
   function clearOwnedTimers() {
@@ -1540,8 +1248,6 @@ module.exports = function activate(api) {
       clearTimeout(hostCloseCheckTimer);
       hostCloseCheckTimer = null;
     }
-    pendingWindowInspectTimers.forEach((timer) => clearImmediate(timer));
-    pendingWindowInspectTimers.clear();
     topmostRetryTimers.forEach((timer) => clearTimeout(timer));
     topmostRetryTimers.clear();
     clearMenuDestroyTimer();
@@ -1549,9 +1255,11 @@ module.exports = function activate(api) {
 
   function closeOwnedWindows() {
     clearOwnedTimers();
+    clientRpcReady = false;
     isDrawerExpanded = false;
     isHoverHidden = false;
     isFullscreenHidden = false;
+    lastSentWindowHidden = null;
     if (menuWindow && !menuWindow.isDestroyed()) {
       menuWindow.close();
       menuWindow = null;
@@ -1568,57 +1276,78 @@ module.exports = function activate(api) {
     }
     hostCloseCheckTimer = setTimeout(() => {
       hostCloseCheckTimer = null;
-      if (!isDisposed && !hasHostBrowserWindow()) {
-        // Closing our top-level BrowserWindows unblocks Electron window-all-closed so Folia exits cleanly
+      if (!isDisposed && !hasLiveHostWindow()) {
         closeOwnedWindows();
       }
     }, 250);
   }
 
-  function watchHostWindow(win) {
-    if (!isHostBrowserWindow(win) || watchedHostWindows.has(win) || typeof win.on !== 'function') {
+  function cancelHostCloseCheck() {
+    if (hostCloseCheckTimer) {
+      clearTimeout(hostCloseCheckTimer);
+      hostCloseCheckTimer = null;
+    }
+  }
+
+  /**
+   * Tracks non-owned Electron BrowserWindows strictly via standard `isVisible()`, `'show'`, and `'closed'`
+   * events so hidden background windows never block exit, while hiding the host window to tray keeps us alive.
+   * @param {Electron.BrowserWindow} win
+   */
+  function trackPotentialHostWindow(win) {
+    if (!isNonOwnedWindow(win) || watchedHostCleanups.has(win) || typeof win.on !== 'function') {
       return;
     }
-    const onHostClosed = () => {
-      watchedHostWindows.delete(win);
-      if (!isDisposed) {
+
+    const markVisibleHost = () => {
+      if (isDisposed || isQuitting || !isNonOwnedWindow(win)) return;
+      seenVisibleHostWindows.add(win);
+      cancelHostCloseCheck();
+      if (!taskbarWindow || taskbarWindow.isDestroyed()) {
+        createWindow();
+      }
+    };
+
+    const onShow = () => {
+      markVisibleHost();
+    };
+
+    const onClosed = () => {
+      const wasTrackedHost = seenVisibleHostWindows.delete(win);
+      cleanup();
+      if (wasTrackedHost && !isDisposed && !hasLiveHostWindow()) {
+        clientRpcReady = false;
         scheduleHostCloseCheck();
       }
     };
-    watchedHostWindows.set(win, onHostClosed);
-    if (typeof win.once === 'function') {
-      win.once('closed', onHostClosed);
-    } else {
-      win.on('closed', onHostClosed);
+
+    const cleanup = () => {
+      watchedHostCleanups.delete(win);
+      try { win.removeListener?.('show', onShow); } catch {}
+      try { win.removeListener?.('closed', onClosed); } catch {}
+    };
+
+    watchedHostCleanups.set(win, cleanup);
+    win.on('show', onShow);
+    win.on('closed', onClosed);
+
+    if (typeof win.isVisible === 'function' && win.isVisible()) {
+      seenVisibleHostWindows.add(win);
+      cancelHostCloseCheck();
     }
   }
 
   try {
-    const initialWindows = BrowserWindow.getAllWindows();
-    initialWindows.forEach(noteWindowTag);
-    initialWindows.forEach(watchHostWindow);
+    BrowserWindow.getAllWindows().forEach(trackPotentialHostWindow);
   } catch {}
 
   const onBrowserWindowCreated = (_event, win) => {
-    if (isDisposed || isCreatingOwnedWindow || win?.__foliaTaskbarLyricsOwned) return;
-    // Defer to setImmediate so electron/main.cjs finishes tagging win.__wallpaperGeometry right after
-    // `new BrowserWindow(...)` returns, and non-host windows never cancel hostCloseCheckTimer.
-    const timer = setImmediate(() => {
-      pendingWindowInspectTimers.delete(timer);
-      if (isDisposed || !isHostBrowserWindow(win)) return;
-      watchHostWindow(win);
-      if (hostCloseCheckTimer) {
-        clearTimeout(hostCloseCheckTimer);
-        hostCloseCheckTimer = null;
-      }
-      if (isEnabled && (!taskbarWindow || taskbarWindow.isDestroyed())) {
-        createWindow();
-      }
-    });
-    pendingWindowInspectTimers.add(timer);
+    if (isDisposed || isQuitting || isCreatingOwnedWindow || win?.__foliaTaskbarLyricsOwned) return;
+    trackPotentialHostWindow(win);
   };
 
   const onAppBeforeQuit = () => {
+    isQuitting = true;
     closeOwnedWindows();
   };
 
@@ -1627,23 +1356,17 @@ module.exports = function activate(api) {
     app.on('before-quit', onAppBeforeQuit);
   }
 
-  // Defer BrowserWindow + native Win32 setup past synchronous activate() so main call cost stays < 100ms
+  // Defer BrowserWindow setup past synchronous activate() so main call cost stays < 100ms
   startupWindowTimer = setImmediate(() => {
     startupWindowTimer = null;
-    if (!isDisposed && (!taskbarWindow || taskbarWindow.isDestroyed())) {
+    if (!isDisposed && !isQuitting && (!taskbarWindow || taskbarWindow.isDestroyed())) {
       createWindow();
     }
   });
 
-  // Active Z-order & fullscreen avoidance watchdog for Windows
+  // Active Z-order & Electron fullscreen avoidance watchdog for Windows
   const topmostKeepAliveTimer = setInterval(() => {
-    if (!taskbarWindow || taskbarWindow.isDestroyed() || !isEnabled) return;
-    if (currentDisplayTarget === 'wallpaper') {
-      const targetDisplay = resolveTargetDisplay();
-      if (targetDisplay && targetDisplay.id !== latestTaskbarSnapshot.displayInfo?.activeId) {
-        repositionWindowsToActiveDisplay();
-      }
-    }
+    if (!taskbarWindow || taskbarWindow.isDestroyed() || isDisposed || isQuitting) return;
     if (syncFullscreenAvoidance()) {
       return;
     }
@@ -1670,12 +1393,11 @@ module.exports = function activate(api) {
     }
     if (topmostKeepAliveTimer) clearInterval(topmostKeepAliveTimer);
 
-    watchedHostWindows.forEach((handler, win) => {
-      try {
-        win.removeListener?.('closed', handler);
-      } catch {}
+    Array.from(watchedHostCleanups.values()).forEach((cleanup) => {
+      try { cleanup(); } catch {}
     });
-    watchedHostWindows.clear();
+    watchedHostCleanups.clear();
+    seenVisibleHostWindows.clear();
 
     if (app && typeof app.removeListener === 'function') {
       app.removeListener('browser-window-created', onBrowserWindowCreated);
@@ -1696,7 +1418,6 @@ module.exports = function activate(api) {
     ipcMain.removeListener('taskbar-lyrics:assert-top', onAssertTop);
     ipcMain.removeListener('taskbar-lyrics:hover-enter', onHoverEnter);
     ipcMain.removeListener('taskbar-lyrics:switch-display', onSwitchDisplay);
-    ipcMain.removeListener('taskbar-lyrics:move-vertical', onMoveVertical);
 
     closeOwnedWindows();
   };
