@@ -190,6 +190,7 @@ export default function activate(folium) {
     lyricOffsetMs: 0,
     updatedAt: Date.now(),
     lyrics: null,
+    lyricsVisible: true,
     queue: [],
     queueTotal: 0,
     queuePage: 0,
@@ -205,6 +206,7 @@ export default function activate(folium) {
     settings: {
       interactionMode: 'standard',
       targetDisplay: 'primary',
+      showLyrics: true,
       showTranslation: true,
       useCoverBackground: true,
     },
@@ -1784,6 +1786,19 @@ export default function activate(folium) {
         ],
       },
       {
+        key: 'showLyrics',
+        type: 'boolean',
+        label: {
+          'zh-CN': '显示任务栏歌词',
+          en: 'Show Taskbar Lyrics',
+        },
+        description: {
+          'zh-CN': '关闭后任务栏中央仅静态显示当前曲目标题与作者（也可点击弹窗底部眼睛按钮或绑定全局快捷键）',
+          en: 'When disabled, the center stage shows song title and artist only instead of scrolling lyrics',
+        },
+        defaultValue: true,
+      },
+      {
         key: 'showTranslation',
         type: 'boolean',
         label: {
@@ -1838,24 +1853,59 @@ export default function activate(folium) {
         void folium.rpc.call('switchDisplay');
       },
     });
+    folium.registries.commands.register({
+      id: 'toggle-lyrics',
+      label: {
+        'zh-CN': '显示/隐藏任务栏歌词正文',
+        en: 'Toggle Taskbar Lyrics Text',
+      },
+      description: {
+        'zh-CN': '切换任务栏中央是否显示滚动歌词（隐藏时仅展示歌名与作者）',
+        en: 'Toggle scrolling lyrics in the taskbar drawer (shows song title and artist when hidden)',
+      },
+      globalShortcut: true,
+      run: () => {
+        toggleGlobalShowLyrics();
+      },
+    });
+  }
+
+  function toggleGlobalShowLyrics() {
+    const nextShow = currentSnapshot.settings?.showLyrics === false;
+    currentSnapshot.settings = {
+      ...currentSnapshot.settings,
+      showLyrics: nextShow,
+    };
+    currentSnapshot.lyricsVisible = nextShow;
+    try {
+      settingsAccess?.set?.({ showLyrics: nextShow });
+    } catch {}
+    void pushSnapshot({
+      settings: currentSnapshot.settings,
+      lyricsVisible: nextShow,
+    });
   }
 
   function syncSettings() {
     try {
       if (settingsAccess?.get) {
         const values = settingsAccess.get();
+        const showLyrics = values?.showLyrics;
         const showTr = values?.showTranslation;
         const useBg = values?.useCoverBackground;
         const mode = values?.interactionMode === 'hover-hide' ? 'hover-hide' : 'standard';
         const display = typeof values?.targetDisplay === 'string' && values.targetDisplay
           ? values.targetDisplay
           : 'primary';
+        const resolvedShowLyrics = typeof showLyrics === 'boolean' ? showLyrics : true;
         currentSnapshot.settings = {
           interactionMode: mode,
           targetDisplay: display,
+          showLyrics: resolvedShowLyrics,
           showTranslation: typeof showTr === 'boolean' ? showTr : true,
           useCoverBackground: typeof useBg === 'boolean' ? useBg : true,
         };
+        currentSnapshot.lyricsVisible = resolvedShowLyrics;
       }
     } catch {
       // Ignored
@@ -1869,7 +1919,10 @@ export default function activate(folium) {
   if (typeof settingsAccess?.onChange === 'function') {
     unsubs.push(settingsAccess.onChange(() => {
       syncSettings();
-      void pushSnapshot({ settings: currentSnapshot.settings });
+      void pushSnapshot({
+        settings: currentSnapshot.settings,
+        lyricsVisible: currentSnapshot.lyricsVisible,
+      });
     }));
   }
 
@@ -2268,6 +2321,7 @@ export default function activate(folium) {
     lyricOffsetMs: currentSnapshot.lyricOffsetMs,
     updatedAt: currentSnapshot.updatedAt,
     lyrics: currentSnapshot.lyrics,
+    lyricsVisible: currentSnapshot.lyricsVisible,
     queue: currentSnapshot.queue,
     queueTotal: currentSnapshot.queueTotal,
     queuePage: currentSnapshot.queuePage,
@@ -2541,6 +2595,10 @@ export default function activate(folium) {
       }
       case 'playRadioFm': {
         await playPersonalFmMode();
+        break;
+      }
+      case 'toggleShowLyrics': {
+        toggleGlobalShowLyrics();
         break;
       }
     }

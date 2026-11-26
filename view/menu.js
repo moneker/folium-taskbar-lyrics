@@ -21,6 +21,9 @@
   const viewContainer = document.getElementById('viewContainer');
 
   // DOM Elements - Footer Controls
+  const lyricsToggleBtn = document.getElementById('lyricsToggleBtn');
+  const lyricsEyeIcon = document.getElementById('lyricsEyeIcon');
+  const lyricsEyeOffIcon = document.getElementById('lyricsEyeOffIcon');
   const loopModeBtn = document.getElementById('loopModeBtn');
   const shuffleBtn = document.getElementById('shuffleBtn');
   const displaySwitchBtn = document.getElementById('displaySwitchBtn');
@@ -74,6 +77,8 @@
     loopMode: 'all',
     volume: 100,
     isMuted: false,
+    showLyrics: true,
+    lyricsVisible: true,
   };
 
   function escapeHtml(str) {
@@ -156,10 +161,6 @@
     rootStyle.setProperty('--accent-glow', colorWithAlpha(accent, 0.45));
     rootStyle.setProperty('--accent-gradient', `linear-gradient(135deg, ${accent}, ${colorWithAlpha(accent, 0.8)})`);
     rootStyle.setProperty('--scrollbar-thumb', colorWithAlpha(primary, isDaylight ? 0.20 : 0.25));
-
-    if (theme.fontFamily) {
-      rootStyle.setProperty('--app-font-family', theme.fontFamily);
-    }
   }
 
   // =========================================================================
@@ -1186,7 +1187,43 @@
       }
       updateVolume(footerState.volume, footerState.isMuted);
     }
+
+    // 9. Lyrics Display Toggle
+    if (data.settings !== undefined || data.lyricsVisible !== undefined) {
+      if (data.settings && typeof data.settings.showLyrics === 'boolean') {
+        footerState.showLyrics = data.settings.showLyrics;
+      }
+      if (typeof data.lyricsVisible === 'boolean') {
+        footerState.lyricsVisible = data.lyricsVisible;
+      }
+      updateLyricsDisplayControls();
+    }
   });
+
+  function updateLyricsDisplayControls() {
+    const showGlobal = footerState.showLyrics !== false && footerState.lyricsVisible !== false;
+    if (lyricsToggleBtn) {
+      lyricsToggleBtn.classList.toggle('is-muted', !showGlobal);
+      lyricsToggleBtn.setAttribute('aria-pressed', showGlobal ? 'true' : 'false');
+      lyricsToggleBtn.title = showGlobal
+        ? '点击隐藏任务栏歌词（仅显示歌名与作者）'
+        : '点击恢复显示任务栏歌词';
+    }
+    if (lyricsEyeIcon) {
+      lyricsEyeIcon.classList.toggle('hidden', !showGlobal);
+    }
+    if (lyricsEyeOffIcon) {
+      lyricsEyeOffIcon.classList.toggle('hidden', showGlobal);
+    }
+  }
+
+  if (lyricsToggleBtn) {
+    lyricsToggleBtn.addEventListener('click', () => {
+      bridge.sendPlaybackAction('toggleShowLyrics');
+    });
+  }
+
+  updateLyricsDisplayControls();
 
   // Default start: Open in 播放队列 (or 书库)
   // Initially show 播放队列 so user can immediately see and control live queue,
